@@ -4,12 +4,13 @@
 交互：
   - 鼠标左键拖动人物到其他位置
   - 鼠标右键人物切换姿态（爬行 / 坐姿 / 招手 循环）
-  - 任务栏系统托盘图标（原生 win32gui）：每人显隐开关 + 退出
+  - 鼠标左键双击人物：宠物喊"爸！"并弹出气泡对话
+  - 任务栏系统托盘图标（pystray）：每人显隐开关 + 退出
   - ESC 关闭程序
 """
 
 import tkinter as tk
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import win32gui
 import win32con
 import win32api
@@ -34,6 +35,10 @@ UPDATE_MS = 1000 // FPS
 BOB_AMP = 6
 BOB_SPEED = 0.18
 SCALE_RANGE = 0.025
+
+# 气泡对话（如"叫爸爸"）
+BUBBLE_FONT_SIZE = 34
+BUBBLE_DURATION_MS = 2500
 
 # 支持的动作姿态图片格式
 IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.tif', '.tiff')
@@ -279,6 +284,40 @@ class PystrayTrayIcon:
 # ============================================================
 # 宠物类
 # ============================================================
+_FONT_CACHE = {}
+
+
+def load_cjk_font(size):
+    """加载一个能正确渲染中文的字体（带缓存）。
+
+    PIL 默认位图字体只支持 Latin，渲染中文会变成方块。这里优先找系统
+    自带的中文字体（msyh/simhei/simsun 等），找不到再退回默认字体。
+    """
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+    candidates = [
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyhbd.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
+        "C:/Windows/Fonts/malgun.ttf",
+    ]
+    font = None
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                font = ImageFont.truetype(p, size)
+                break
+            except Exception:
+                continue
+    if font is None:
+        try:
+            font = ImageFont.truetype("arial.ttf", size)
+        except Exception:
+            font = ImageFont.load_default()
+    _FONT_CACHE[size] = font
+    return font
+
 class MatePaw:
     def __init__(self, canvas, char_dir, char_id, label, screen_w, screen_h):
         self.canvas = canvas
@@ -333,10 +372,18 @@ class MatePaw:
             image=self.photo, anchor='center', tags='pet'
         )
 
+        # 气泡对话图层（默认隐藏，喊"爸！"等时显示）
+        self.bubble_id = canvas.create_image(0, 0, state='hidden', anchor='center')
+        self.bubble_until = 0.0          # 气泡消失的时间戳（time.time()）
+        self.bubble_photo = None         # 当前气泡的 PhotoImage（需持有引用防 GC）
+        self.bubble_w = 0
+        self.bubble_h = 0
+
     def update(self):
         try:
             if not self.visible:
                 self.canvas.itemconfig(self.img_id, state='hidden')
+                self.canvas.itemconfig(self.bubble_id, state='hidden')
                 return
             self.canvas.itemconfig(self.img_id, state='normal')
 
@@ -453,6 +500,65 @@ class MatePaw:
         cy = self.y + SPRITE_H // 2 + bob_y + (new_h - SPRITE_H) // 2
         self.canvas.coords(self.img_id, cx, cy)
         self.canvas.itemconfig(self.img_id, image=self.photo)
+        self._update_bubble()
+
+    def say(self, text, duration_ms=BUBBLE_DURATION_MS):
+        """弹出气泡对话（如喊"爸！"）。duration_ms 毫秒后自动消失。"""
+        try:
+            img, w, h = self._build_bubble(text)
+            self.bubble_photo = ImageTk.PhotoImage(img)
+            self.bubble_w = w
+            self.bubble_h = h
+            self.bubble_until = time.time() + duration_ms / 1000.0
+            self.canvas.itemconfig(self.bubble_id, image=self.bubble_photo)
+        except Exception as e:
+            print(f"[Pet {self.label}] say error: {e}")
+
+    def _build_bubble(self, text):
+        """用 PIL 现画一个白色圆角气泡 + 朝下小尾巴 + 居中文字，返回 (img, w, h)。"""
+        font = load_cjk_font(BUBBLE_FONT_SIZE)
+        pad_x, pad_y = 22, 14
+        # 先用临时画布测量文字尺寸
+        tmp = Image.new('RGBA', (4, 4))
+        d = ImageDraw.Draw(tmp)
+        bbox = d.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        w = tw + pad_x * 2
+        h = th + pad_y * 2
+        tail = 16  # 尾巴高度
+        img = Image.new('RGBA', (w, h + tail), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        # 气泡主体（圆角矩形）
+        d.rounded_rectangle([0, 0, w, h], radius=min(22, h // 3),
+                            fill=(255, 255, 255, 248),
+                            outline=(70, 70, 70, 255), width=3)
+        # 朝下的小尾巴：用与主体同色填充，顺带遮住底部轮廓在尾巴宽度内的横线
+        cx = w // 2
+        d.polygon([(cx - 13, h - 1), (cx + 13, h - 1), (cx, h + tail)],
+                  fill=(255, 255, 255, 248))
+        # 文字（用 textbbox 左上偏移对齐，避免默认基线导致文字偏上）
+        d.text((pad_x - bbox[0], pad_y - bbox[1]), text, font=font,
+               fill=(25, 25, 25, 255))
+        return img, w, h + tail
+
+    def _update_bubble(self):
+        """每帧调用：根据时间戳和可见性决定气泡是否显示，并跟随宠物定位。"""
+        active = (self.bubble_until and time.time() < self.bubble_until
+                  and self.visible and self.bubble_photo)
+        if not active:
+            self.canvas.itemconfig(self.bubble_id, state='hidden')
+            return
+        bx = self.x + SPRITE_W // 2
+        # 默认浮在头顶上方；太靠近屏幕顶部则改到身体下方
+        top_y = self.y - self.bubble_h // 2 - 10
+        if top_y < self.bubble_h // 2 + 4:
+            by = self.y + SPRITE_H + self.bubble_h // 2 + 10
+        else:
+            by = top_y
+        by = min(by, self.screen_h - self.bubble_h // 2 - 4)
+        self.canvas.itemconfig(self.bubble_id, state='normal')
+        self.canvas.coords(self.bubble_id, bx, by)
+
 
 
 # ============================================================
@@ -563,6 +669,8 @@ class MatePawApp:
         self.canvas.bind('<ButtonRelease-1>', self._on_canvas_btn1_release)
         # 右键点宠物（在钩子吞掉事件之外的兜底，避免极少数情形还能看到系统菜单）
         self.canvas.tag_bind('pet', '<ButtonPress-3>', self._on_canvas_btn3_press)
+        # 双击人物：宠物喊"爸！"弹气泡（canvas 级绑定，不受拖动 grab 影响）
+        self.canvas.bind('<Double-Button-1>', self._on_canvas_btn1_double)
 
     def _on_canvas_btn1_press(self, event):
         pet = self._pet_at(event.x_root, event.y_root)
@@ -601,6 +709,12 @@ class MatePawApp:
         if pet:
             pet.next_pose()
         return 'break'  # 阻止 canvas 把事件传到别处（在我们的 SetWindowRgn 方案里这层通常不会触发）
+
+    def _on_canvas_btn1_double(self, event):
+        pet = self._pet_at(event.x_root, event.y_root)
+        if pet:
+            pet.say("爸！")
+        return 'break'
 
 
 
@@ -749,7 +863,7 @@ class MatePawApp:
 
     def run(self):
         print(f"[mate_paw] {len(self.pets)} pets on {self.screen_w}x{self.screen_h}")
-        print("左键拖动 / 右键换姿态 / 托盘图标开关人物 / Esc 退出")
+        print("左键拖动 / 右键换姿态 / 双击喊爸爸 / 托盘图标开关人物 / Esc 退出")
         self.root.mainloop()
 
 
