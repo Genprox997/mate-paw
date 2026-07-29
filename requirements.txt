@@ -1,0 +1,6 @@
+# 运行依赖
+Pillow>=10.0
+pywin32>=306
+
+# 仅打包 exe 时需要
+PyInstaller>=6.0

@@ -1,0 +1,27 @@
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*.pyc
+*.egg-info/
+.eggs/
+
+# ----- 虚拟环境 -----
+.venv/
+venv/
+env/
+
+# ----- PyInstaller 构建产物 -----
+build/
+dist/
+
+# ----- AI 助手内部数据（非项目源码）-----
+.workbuddy/
+
+# ----- 美术生成中间产物（不参与构建/运行，res/ 已含最终精灵）-----
+assets/
+
+# ----- 编辑器 / 系统 -----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
