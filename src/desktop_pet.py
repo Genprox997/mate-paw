@@ -229,7 +229,10 @@ class PystrayTrayIcon:
             items.append(
                 pystray.MenuItem(
                     pet.label,
-                    lambda i=i: self._on_toggle(i),
+                    # 注意：pystray 调用 action 时会把 icon 作为第一个位置参数传入，
+                    # 因此这里用 *_ 吃掉该参数，只用闭包捕获的索引 i 触发切换，
+                    # 否则 i 会被 icon 对象覆盖导致 _toggle_pet 索引校验失败（静默无效）。
+                    lambda *_args, i=i: self._on_toggle(i),
                     checked=lambda item, i=i: self.pets[i].visible,
                 )
             )
