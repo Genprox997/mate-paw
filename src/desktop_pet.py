@@ -198,8 +198,17 @@ def pil_to_hicon(image, size=48):
     """将 PIL Image 转换为 Windows HICON 句柄。通过保存临时 ICO 文件实现。"""
     import tempfile
     img = image.convert('RGBA').resize((size, size), Image.LANCZOS)
-    fd, path = tempfile.mktemp(suffix='.ico')
+    # 注意：tempfile.mktemp 在 Python 3 下只返回单个 path 字符串（不解包成 tuple）。
+    # 原代码 fd, path = tempfile.mktemp(...) 会抛 "too many values to unpack"，导致
+    # 这里静默返回 None，托盘图标永远不被添加（这是 v5 托盘消失的根因）。
+    # 用 mkstemp 拿一个真正的文件 fd，写完再关/删。
+    fd, path = tempfile.mkstemp(suffix='.ico')
     try:
+        try:
+            import os as _os
+            _os.close(fd)
+        except Exception:
+            pass
         img.save(path, format='ICO', sizes=[(size, size)])
         hicon = win32gui.LoadImage(
             0, path, win32con.IMAGE_ICON, size, size,
@@ -208,6 +217,12 @@ def pil_to_hicon(image, size=48):
         return hicon
     except Exception:
         return None
+    finally:
+        try:
+            import os as _os
+            _os.remove(path)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -221,13 +236,15 @@ class NativeTrayIcon:
     IDM_FIRST_TOGGLE = 2000
     IDM_QUIT = 2999
 
-    def __init__(self, pets, on_quit_callback):
+    def __init__(self, pets, on_quit_callback, on_toggle_callback=None):
         """
         pets: list of MatePaw 对象（需要有 .label 和 .visible 属性）
         on_quit_callback: 退出回调函数
+        on_toggle_callback: 切换人物显隐的回调，参数为人物在 pets 列表中的索引
         """
         self.pets = pets
         self.on_quit = on_quit_callback
+        self.on_toggle = on_toggle_callback
         self.hwnd = None
         self.hicon = None
         self.running = False
@@ -308,10 +325,8 @@ class NativeTrayIcon:
                 self.on_quit()
             elif self.IDM_FIRST_TOGGLE <= cmd_id < self.IDM_QUIT:
                 idx = cmd_id - self.IDM_FIRST_TOGGLE
-                with self._lock:
-                    if 0 <= idx < len(self.pets):
-                        pet = self.pets[idx]
-                        pet.set_visible(not pet.visible)
+                if self.on_toggle:
+                    self.on_toggle(idx)
             return 0
         elif msg == win32con.WM_DESTROY:
             win32gui.PostQuitMessage(0)
@@ -392,9 +407,11 @@ class NativeTrayIcon:
             win32gui.AppendMenu(menu, win32con.MF_STRING, self.IDM_QUIT, "退出")
 
             # 显示菜单
+            # 注意：使用 TPM_RETURNCMD 时，TrackPopupMenu 直接返回被选中项的 ID，
+            # 不会向窗口发送 WM_COMMAND。因此必须在此处处理返回值，否则菜单点击无反应。
             pos = win32api.GetCursorPos()
             win32gui.SetForegroundWindow(self.hwnd)
-            win32gui.TrackPopupMenu(
+            cmd = win32gui.TrackPopupMenu(
                 menu,
                 win32con.TPM_RIGHTBUTTON | win32con.TPM_RETURNCMD,
                 pos[0], pos[1],
@@ -402,6 +419,14 @@ class NativeTrayIcon:
             )
             win32gui.PostMessage(self.hwnd, win32con.WM_NULL, 0, 0)
             win32gui.DestroyMenu(menu)
+
+            # 直接派发命令（通过回调调度到主线程执行，避免 tkinter 跨线程崩溃）
+            if cmd == self.IDM_QUIT:
+                self.on_quit()
+            elif self.IDM_FIRST_TOGGLE <= cmd < self.IDM_QUIT:
+                idx = cmd - self.IDM_FIRST_TOGGLE
+                if self.on_toggle:
+                    self.on_toggle(idx)
 
         except Exception as e:
             print(f"[Tray] Menu error: {e}")
@@ -600,9 +625,13 @@ class MatePawApp:
         self._hook = None
         self._hook_running = True
         self.tray = None
+        self.hwnd = None  # 主窗口句柄，用于 SetWindowRgn
+        # 鼠标钩子内用于跟踪是否吞掉右键事件（仅由钩子线程读写，避免竞态）
+        self._r_block = False
 
         self._setup_window()
         self._create_canvas()
+        self._bind_canvas_events()  # canvas 事件绑定（替代钩子处理左键拖动）
         self._load_pets()
         self._setup_tray_icon()   # 原生 win32 托盘图标
 
@@ -626,13 +655,110 @@ class MatePawApp:
 
         self.root.update_idletasks()
         hwnd = win32gui.FindWindow(None, self.WINDOW_TITLE)
+        self.hwnd = hwnd
         if hwnd:
             try:
                 ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-                ex |= win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_TOOLWINDOW
+                # 不加 WS_EX_TRANSPARENT：之前用 WH_MOUSE_LL 钩子吞掉 LBUTTONDOWN 会让 Windows
+                # 进入"按键未释放"状态，导致下一次点击不再产生事件（卡死）。
+                # 现在改用 SetWindowRgn 把窗口限制为宠物矩形 —— 区域外点击直接穿透到桌面，
+                # 区域内由 canvas 事件处理拖动。
+                ex |= win32con.WS_EX_LAYERED | win32con.WS_EX_TOOLWINDOW
                 win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex)
             except Exception as e:
                 print(f"Warning: style: {e}")
+        # 初始 region：根据可见宠物集合随时更新
+        self._update_window_region()
+
+    def _update_window_region(self):
+        """把窗口的可点击区域限制为可见宠物矩形的并集。
+        区域之外的鼠标事件直接穿透到桌面 —— 这是替代 WS_EX_TRANSPARENT 的"局部可点"方案，
+        与钩子吞事件不同，它会让 Windows 正确收到鼠标释放消息，避免卡死。
+        SetWindowRgn 接管传入 region 的所有权，下次调用或销毁窗口时会自动释放。
+        拖动期间由 _set_window_region_fullscreen 接管，本方法不会再被调用。
+        """
+        if not self.hwnd or self.drag:
+            return
+        try:
+            combined = win32gui.CreateRectRgn(0, 0, 0, 0)  # 空的初始 region
+            for pet in self.pets:
+                if not pet.visible:
+                    continue
+                x1 = max(0, pet.x)
+                y1 = max(0, pet.y)
+                x2 = min(self.screen_w, pet.x + SPRITE_W)
+                y2 = min(self.screen_h, pet.y + SPRITE_H)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                r = win32gui.CreateRectRgn(x1, y1, x2, y2)
+                # CombineRgn(目标, src1, src2, 操作) 把 r 合入 combined；RGN_OR=2
+                win32gui.CombineRgn(combined, combined, r, getattr(win32api, 'RGN_OR', 2))
+            win32gui.SetWindowRgn(self.hwnd, combined, True)
+        except Exception:
+            # 失败回退到全屏 region（不损失功能，但点击可能落到桌面图标）
+            self._set_window_region_fullscreen()
+
+    def _set_window_region_fullscreen(self):
+        """拖动期间调用：把 region 临时设为全屏，保证鼠标在屏幕任意位置
+        移动都能触发 canvas 的 <B1-Motion>。"""
+        if not self.hwnd:
+            return
+        try:
+            full = win32gui.CreateRectRgn(0, 0, self.screen_w, self.screen_h)
+            win32gui.SetWindowRgn(self.hwnd, full, True)
+        except Exception:
+            pass
+
+    def _bind_canvas_events(self):
+        """在 canvas 上绑定宠物拖动/释放/右键事件 —— 替代之前依赖鼠标钩子的方案。"""
+        # 按下：在宠物 canvas item 上命中时触发；命中后 grab_set，使后续
+        # Motion 即使鼠标离开宠物区域也能继续路由到 canvas
+        self.canvas.tag_bind('pet', '<ButtonPress-1>', self._on_canvas_btn1_press)
+        # 拖动 / 释放：绑在 canvas 上而不是 tag 上，确保即使宠物跟随鼠标移动，事件仍能继续被处理
+        self.canvas.bind('<B1-Motion>', self._on_canvas_btn1_motion)
+        self.canvas.bind('<ButtonRelease-1>', self._on_canvas_btn1_release)
+        # 右键点宠物（在钩子吞掉事件之外的兜底，避免极少数情形还能看到系统菜单）
+        self.canvas.tag_bind('pet', '<ButtonPress-3>', self._on_canvas_btn3_press)
+
+    def _on_canvas_btn1_press(self, event):
+        pet = self._pet_at(event.x_root, event.y_root)
+        if not pet:
+            return
+        self.drag = {'pet': pet, 'ox': event.x_root - pet.x, 'oy': event.y_root - pet.y}
+        pet.dragging = True
+        # 拖动期间 region 切到全屏，否则宠物跟随鼠标离开原区域后收不到后续事件
+        self._set_window_region_fullscreen()
+        try:
+            self.canvas.grab_set()
+        except Exception:
+            pass
+        return 'break'
+
+    def _on_canvas_btn1_motion(self, event):
+        if not self.drag:
+            return
+        pet = self.drag['pet']
+        pet.x = min(max(event.x_root - self.drag['ox'], 0), self.screen_w - SPRITE_W)
+        pet.y = min(max(event.y_root - self.drag['oy'], 0), self.screen_h - SPRITE_H)
+
+    def _on_canvas_btn1_release(self, event):
+        if self.drag:
+            self.drag['pet'].dragging = False
+            self.drag = None
+        try:
+            self.canvas.grab_release()
+        except Exception:
+            pass
+        # 拖动结束，恢复成"只覆盖宠物矩形"的 region（外面点击重新穿透到桌面）
+        self._update_window_region()
+
+    def _on_canvas_btn3_press(self, event):
+        pet = self._pet_at(event.x_root, event.y_root)
+        if pet:
+            pet.next_pose()
+        return 'break'  # 阻止 canvas 把事件传到别处（在我们的 SetWindowRgn 方案里这层通常不会触发）
+
+
 
     def _create_canvas(self):
         self.canvas = tk.Canvas(self.root, width=self.screen_w, height=self.screen_h,
@@ -674,10 +800,23 @@ class MatePawApp:
             self.tray = NativeTrayIcon(
                 pets=self.pets,
                 on_quit_callback=lambda: self.root.after(0, self._on_close),
+                on_toggle_callback=self._on_tray_toggle,
             )
             self.tray.start()
         except Exception as e:
             print(f"[Tray] ERROR starting native tray: {e}")
+
+    def _on_tray_toggle(self, idx):
+        """托盘菜单切换人物显隐——从托盘线程调用，调度到主线程执行。"""
+        self.root.after(0, lambda: self._toggle_pet(idx))
+
+    def _toggle_pet(self, idx):
+        """主线程中执行人物显隐切换。"""
+        if 0 <= idx < len(self.pets):
+            pet = self.pets[idx]
+            pet.set_visible(not pet.visible)
+            # 显隐变化后立即同步窗口可点区域（隐藏的宠物不应该再接住点击）
+            self._update_window_region()
 
     # ---- 鼠标钩子 ----
     def _hook_thread(self):
@@ -688,17 +827,32 @@ class MatePawApp:
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def _hook_proc_impl(self, nCode, wParam, lParam):
+        """
+        低级鼠标钩子（仅用于屏蔽右键系统菜单）。
+
+        左键拖动现在由 canvas 事件 + SetWindowRgn 处理，不再通过此钩子吞事件。
+        之所以这样设计：用钩子吞掉 LBUTTONDOWN 会让 Windows 进入"按钮未释放"
+        状态，导致下一次点击不再产生事件（左键拖动卡死）。
+        SetWindowRgn 把窗口限定在宠物矩形 → 区域内点击由 canvas 处理、区域外
+        点击穿透到桌面 → 完全不需要吞事件，桌面就不会误触发框选/拖动。
+        右键系统菜单只能靠钩子屏蔽（canvas tkinter 绑定无法阻止 Windows
+        DefWindowProc 生成 WM_CONTEXTMENU），所以右键这里仍走吞事件路线。
+        """
         if nCode >= 0:
             hs = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
             x, y = hs.pt.x, hs.pt.y
-            if wParam == WM_LBUTTONDOWN:
-                self.mouse_q.put(('down', x, y))
-            elif wParam == WM_LBUTTONUP:
-                self.mouse_q.put(('up', x, y))
-            elif wParam == WM_RBUTTONDOWN:
-                self.mouse_q.put(('rdown', x, y))
-            elif wParam == WM_MOUSEMOVE and self.drag is not None:
-                self.mouse_q.put(('move', x, y))
+            if wParam == WM_RBUTTONDOWN:
+                pet = self._pet_at(x, y)
+                if pet:
+                    # 右键点中宠物：吞掉按下，避免桌面资源管理器显示系统右键菜单
+                    self._r_block = True
+                    self.mouse_q.put(('rdown', x, y))
+                    return 1
+            elif wParam == WM_RBUTTONUP:
+                if self._r_block:
+                    # 吞掉配套抬起，否则 DefWindowProc 会以按下位置弹出 WM_CONTEXTMENU
+                    self._r_block = False
+                    return 1
         return 0
 
     def _pet_at(self, x, y):
@@ -712,21 +866,8 @@ class MatePawApp:
         return None
 
     def _handle_mouse(self, et, x, y):
-        if et == 'down':
-            pet = self._pet_at(x, y)
-            if pet:
-                self.drag = {'pet': pet, 'ox': x - pet.x, 'oy': y - pet.y}
-                pet.dragging = True
-        elif et == 'move':
-            if self.drag:
-                pet = self.drag['pet']
-                pet.x = min(max(x - self.drag['ox'], 0), self.screen_w - SPRITE_W)
-                pet.y = min(max(y - self.drag['oy'], 0), self.screen_h - SPRITE_H)
-        elif et == 'up':
-            if self.drag:
-                self.drag['pet'].dragging = False
-                self.drag = None
-        elif et == 'rdown':
+        # 现在只剩下 'rdown'（左键拖动走 canvas 事件，不经过这里）
+        if et == 'rdown':
             pet = self._pet_at(x, y)
             if pet:
                 pet.next_pose()
@@ -740,6 +881,8 @@ class MatePawApp:
             pass
         for pet in self.pets:
             pet.update()
+        # 让窗口 region 跟随可见宠物的位置一起移动（拖动中由 fullscreen 接管，会跳过）
+        self._update_window_region()
         self.root.after(UPDATE_MS, self._animate)
 
     def _on_close(self):
@@ -767,4 +910,13 @@ class MatePawApp:
 
 
 if __name__ == '__main__':
+    # 冻结的 GUI 模式（console=False）下 sys.stdout/stderr 可能为 None，
+    # 此处兜底重定向到 devnull，避免任何 print() 调用抛异常。
+    try:
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, 'w')
+        if sys.stderr is None:
+            sys.stderr = open(os.devnull, 'w')
+    except Exception:
+        pass
     MatePawApp().run()
