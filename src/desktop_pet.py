@@ -1,5 +1,5 @@
 """
-桌面宠物应用 - Monkey Pets (v5)
+桌面宠物应用 - mate-paw (v5)
 4 个"人形猴子"在桌面自由爬行玩耍，感知窗口边缘作为障碍物。
 交互：
   - 鼠标左键拖动人物到其他位置
@@ -130,7 +130,7 @@ def get_window_rects(cache_ttl=2.0):
 
     screen_w = get_screen_size()[0]
     screen_h = get_screen_size()[1]
-    our_title = 'MonkeyPets_DesktopPet'
+    our_title = 'mate_paw'
     rects = []
 
     def enum_cb(hwnd, _):
@@ -223,7 +223,7 @@ class NativeTrayIcon:
 
     def __init__(self, pets, on_quit_callback):
         """
-        pets: list of MonkeyPet 对象（需要有 .label 和 .visible 属性）
+        pets: list of MatePaw 对象（需要有 .label 和 .visible 属性）
         on_quit_callback: 退出回调函数
         """
         self.pets = pets
@@ -258,7 +258,7 @@ class NativeTrayIcon:
         try:
             # 1. 创建隐藏窗口类
             wc = win32gui.WNDCLASS()
-            wc.lpszClassName = "MonkeyPetsTrayWnd"
+            wc.lpszClassName = "MatePawTrayWnd"
             wc.lpfnWndProc = self._wnd_proc
             wc.hInstance = win32api.GetModuleHandle(None)
 
@@ -266,7 +266,7 @@ class NativeTrayIcon:
 
             # 2. 创建隐藏窗口
             self.hwnd = win32gui.CreateWindowEx(
-                0, class_atom, "MonkeyPets Tray",
+                0, class_atom, "MatePaw Tray",
                 0, 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None
             )
 
@@ -410,7 +410,7 @@ class NativeTrayIcon:
 # ============================================================
 # 宠物类
 # ============================================================
-class MonkeyPet:
+class MatePaw:
     def __init__(self, canvas, char_dir, char_id, label, screen_w, screen_h):
         self.canvas = canvas
         self.char_id = char_id
@@ -589,8 +589,8 @@ class MonkeyPet:
 # ============================================================
 # 主应用
 # ============================================================
-class DesktopPetApp:
-    WINDOW_TITLE = 'MonkeyPets_DesktopPet'
+class MatePawApp:
+    WINDOW_TITLE = 'mate_paw'
 
     def __init__(self):
         self.root = tk.Tk()
@@ -661,7 +661,7 @@ class DesktopPetApp:
         for cid in char_ids:
             char_dir = os.path.join(res_dir, cid)
             try:
-                pet = MonkeyPet(self.canvas, char_dir, cid, cid, self.screen_w, self.screen_h)
+                pet = MatePaw(self.canvas, char_dir, cid, cid, self.screen_w, self.screen_h)
                 self.pets.append(pet)
                 print(f"[Pet] 已加载人物 {cid}（共 {pet.pose_count} 个姿态）")
             except Exception as e:
@@ -761,10 +761,10 @@ class DesktopPetApp:
             pass
 
     def run(self):
-        print(f"[MonkeyPets] {len(self.pets)} pets on {self.screen_w}x{self.screen_h}")
+        print(f"[mate_paw] {len(self.pets)} pets on {self.screen_w}x{self.screen_h}")
         print("左键拖动 / 右键换姿态 / 托盘图标开关人物 / Esc 退出")
         self.root.mainloop()
 
 
 if __name__ == '__main__':
-    DesktopPetApp().run()
+    MatePawApp().run()

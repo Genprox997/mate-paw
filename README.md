@@ -1,4 +1,4 @@
-# Monkey Pets · 桌面宠物
+# mate-paw · 桌面宠物
 
 一个 Windows 桌面宠物程序：多只“人形猴子”在桌面自由爬行、随机暂停 / 张望，能感知窗口边缘作为障碍物，支持鼠标拖动与右键切换姿态，并在系统托盘中提供每个人物的显隐开关。
 
@@ -14,7 +14,7 @@
 ## 目录结构
 
 ```
-MonkeyPets/
+mate-paw/
 ├── src/
 │   └── desktop_pet.py        # 主程序
 ├── res/                      # 运行时人物资源（需提交）
@@ -23,7 +23,7 @@ MonkeyPets/
 │       ├── pose2.png         # 其余按文件名排序作为切换姿态
 │       └── ...
 ├── assets/                   # 美术生成中间产物（已被 .gitignore 忽略）
-├── MonkeyPets.spec           # PyInstaller 打包配置
+├── mate_paw.spec             # PyInstaller 打包配置
 ├── requirements.txt
 ├── .gitignore
 └── LICENSE
@@ -50,10 +50,10 @@ python src/desktop_pet.py
 
 ```bash
 pip install -r requirements.txt
-pyinstaller --noconfirm MonkeyPets.spec
+pyinstaller --noconfirm mate_paw.spec
 ```
 
-生成的 `dist/MonkeyPets.exe` 为单文件。分发 / 运行前，需把 `res/` 文件夹放在 exe **同级目录**（即 `dist/MonkeyPets.exe` 与 `dist/res/` 在一起）。
+生成的 `dist/mate_paw.exe` 为单文件。分发 / 运行前，需把 `res/` 文件夹放在 exe **同级目录**（即 `dist/mate_paw.exe` 与 `dist/res/` 在一起）。
 
 ## 如何新增 / 替换人物
 
@@ -64,4 +64,4 @@ pyinstaller --noconfirm MonkeyPets.spec
 
 ## License
 
-[MIT](LICENSE) © 2026 Monkey Pets
+[MIT](LICENSE) © 2026 mate-paw
