@@ -22,6 +22,7 @@ import queue
 import threading
 import ctypes
 from ctypes import wintypes
+import pystray
 
 # ============================================================
 # 配置
@@ -194,242 +195,82 @@ def make_tray_icon_image(size=64):
     return img
 
 
-def pil_to_hicon(image, size=48):
-    """将 PIL Image 转换为 Windows HICON 句柄。通过保存临时 ICO 文件实现。"""
-    import tempfile
-    img = image.convert('RGBA').resize((size, size), Image.LANCZOS)
-    # 注意：tempfile.mktemp 在 Python 3 下只返回单个 path 字符串（不解包成 tuple）。
-    # 原代码 fd, path = tempfile.mktemp(...) 会抛 "too many values to unpack"，导致
-    # 这里静默返回 None，托盘图标永远不被添加（这是 v5 托盘消失的根因）。
-    # 用 mkstemp 拿一个真正的文件 fd，写完再关/删。
-    fd, path = tempfile.mkstemp(suffix='.ico')
-    try:
-        try:
-            import os as _os
-            _os.close(fd)
-        except Exception:
-            pass
-        img.save(path, format='ICO', sizes=[(size, size)])
-        hicon = win32gui.LoadImage(
-            0, path, win32con.IMAGE_ICON, size, size,
-            win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE
-        )
-        return hicon
-    except Exception:
-        return None
-    finally:
-        try:
-            import os as _os
-            _os.remove(path)
-        except Exception:
-            pass
+# 注：pystray.Icon 直接接受 PIL.Image 作为托盘图标，无需转成 Windows HICON，
+# 故移除原先的 pil_to_hicon（基于 tempfile + win32gui.LoadImage）。
+
 
 
 # ============================================================
-# 原生 Win32 系统托盘图标（替代 pystray）
+# 系统托盘图标（基于 pystray，跨平台、稳定）
 # ============================================================
-class NativeTrayIcon:
-    """使用纯 win32gui/win32api 实现的系统托盘图标，在冻结 exe 中稳定工作。"""
-
-    WM_TRAY_CALLBACK = win32con.WM_USER + 1
-    ID_TRAY_APP = 1000
-    IDM_FIRST_TOGGLE = 2000
-    IDM_QUIT = 2999
+class PystrayTrayIcon:
+    """使用 pystray 实现的系统托盘图标，菜单含每人显隐开关 + 退出。"""
 
     def __init__(self, pets, on_quit_callback, on_toggle_callback=None):
         """
         pets: list of MatePaw 对象（需要有 .label 和 .visible 属性）
-        on_quit_callback: 退出回调函数
+        on_quit_callback: 退出回调函数（由 pystray 在后台线程调用，应自行调度到主线程）
         on_toggle_callback: 切换人物显隐的回调，参数为人物在 pets 列表中的索引
         """
         self.pets = pets
         self.on_quit = on_quit_callback
         self.on_toggle = on_toggle_callback
-        self.hwnd = None
-        self.hicon = None
-        self.running = False
-        self.thread = None
-        self._lock = threading.Lock()
+        self.icon = None
+
+    def _build_menu(self):
+        """构建托盘右键菜单：每人一个带勾选状态的显隐开关 + 退出。
+
+        pystray 的 checked 回调在每次展开菜单时求值，因此勾选状态始终反映
+        当前 pet.visible，无需手动刷新菜单。
+        """
+        items = []
+        for i, pet in enumerate(self.pets):
+            # 捕获 i 到默认参数，避免闭包 late binding 让所有项都指向最后一个索引
+            items.append(
+                pystray.MenuItem(
+                    pet.label,
+                    lambda i=i: self._on_toggle(i),
+                    checked=lambda item, i=i: self.pets[i].visible,
+                )
+            )
+        items.append(pystray.MenuItem('退出', self._on_quit))
+        return pystray.Menu(*items)
+
+    def _on_toggle(self, idx):
+        """菜单点击切换人物显隐（在 pystray 后台线程中调用，经回调调度到主线程）。"""
+        if self.on_toggle:
+            self.on_toggle(idx)
+
+    def _on_quit(self, icon=None, item=None):
+        """菜单点击退出。"""
+        if self.on_quit:
+            self.on_quit()
 
     def start(self):
-        """在后台线程启动托盘图标和消息循环。"""
-        self.running = True
-        self.thread = threading.Thread(target=self._run_loop, daemon=True, name="TrayThread")
-        self.thread.start()
-        print("[Tray] Native tray icon started")
+        """在后台守护线程启动托盘图标（run_detached 不阻塞主线程）。"""
+        try:
+            image = make_tray_icon_image(64)
+            self.icon = pystray.Icon(
+                "mate_paw",
+                image,
+                "桌面宠物 🐵",
+                menu=self._build_menu(),
+            )
+            # run_detached：在守护线程中运行消息循环，立即返回，不阻塞 tkinter 主线程
+            self.icon.run_detached()
+            print("[Tray] pystray tray icon started")
+        except Exception as e:
+            print(f"[Tray] ERROR starting pystray tray: {e}")
 
     def stop(self):
-        """停止托盘图标并清理资源。"""
-        self.running = False
-        if self.hwnd:
+        """停止托盘图标并从通知区域移除。"""
+        if self.icon is not None:
             try:
-                self._remove_icon()
-                win32gui.DestroyWindow(self.hwnd)
+                self.icon.stop()
             except Exception:
                 pass
-            self.hwnd = None
+            self.icon = None
         print("[Tray] Tray stopped")
-
-    def _run_loop(self):
-        """托盘线程主循环：创建隐藏窗口、添加图标、消息循环。"""
-        try:
-            # 1. 创建隐藏窗口类
-            wc = win32gui.WNDCLASS()
-            wc.lpszClassName = "MatePawTrayWnd"
-            wc.lpfnWndProc = self._wnd_proc
-            wc.hInstance = win32api.GetModuleHandle(None)
-
-            class_atom = win32gui.RegisterClass(wc)
-
-            # 2. 创建隐藏窗口
-            self.hwnd = win32gui.CreateWindowEx(
-                0, class_atom, "MatePaw Tray",
-                0, 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None
-            )
-
-            # 3. 创建并添加托盘图标
-            icon_img = make_tray_icon_image(48)
-            self.hicon = pil_to_hicon(icon_img, 48)
-            if self.hicon:
-                self._add_icon()
-
-            # 4. 消息循环
-            msg = wintypes.MSG()
-            while self.running:
-                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-                if ret <= 0:
-                    break
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
-
-            # 清理
-            if self.hwnd:
-                self._remove_icon()
-                win32gui.DestroyWindow(self.hwnd)
-                self.hwnd = None
-
-        except Exception as e:
-            print(f"[Tray] Error in tray thread: {e}")
-
-    def _wnd_proc(self, hwnd, msg, wParam, lParam):
-        """隐藏窗口的消息处理函数。"""
-        if msg == self.WM_TRAY_CALLBACK:
-            if lParam == win32con.WM_RBUTTONUP or lParam == win32con.WM_LBUTTONUP:
-                self._show_popup_menu()
-            elif lParam == win32con.WM_LBUTTONDBLCLK:
-                pass  # 双击可扩展功能
-            return 0
-        elif msg == win32con.WM_COMMAND:
-            cmd_id = wParam & 0xFFFF
-            if cmd_id == self.IDM_QUIT:
-                self.on_quit()
-            elif self.IDM_FIRST_TOGGLE <= cmd_id < self.IDM_QUIT:
-                idx = cmd_id - self.IDM_FIRST_TOGGLE
-                if self.on_toggle:
-                    self.on_toggle(idx)
-            return 0
-        elif msg == win32con.WM_DESTROY:
-            win32gui.PostQuitMessage(0)
-            return 0
-        return win32gui.DefWindowProc(hwnd, msg, wParam, lParam)
-
-    def _add_icon(self):
-        """添加托盘图标到通知区域。"""
-        nid = (
-            self.hwnd,           # hwnd
-            self.ID_TRAY_APP,    # uID
-            win32con.NIF_ICON | win32con.NIF_MESSAGE | win32con.NIF_TIP,  # uFlags
-            self.WM_TRAY_CALLBACK,  # uCallbackMessage
-            self.hicon,          # hIcon
-            "桌面宠物 🐵",       # szTip (tooltip)
-        )
-        # 使用 Shell_NotifyIconW (wide string version)
-        nid_struct = self._make_notify_icon_data(nid)
-        win32gui.Shell_NotifyIcon(win32con.NIM_ADD, nid_struct)
-
-    def _remove_icon(self):
-        """从通知区域移除托盘图标。"""
-        nid = (self.hwnd, self.ID_TRAY_APP, 0, 0, 0, "")
-        nid_struct = self._make_notify_icon_data(nid)
-        win32gui.Shell_NotifyIcon(win32con.NIM_DELETE, nid_struct)
-
-    @staticmethod
-    def _make_notify_icon_data(nid):
-        """构建 NOTIFYICONDATA 结构体用于 Shell_NotifyIcon。"""
-        class NOTIFYICONDATA(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.DWORD),
-                ("hWnd", wintypes.HWND),
-                ("uID", wintypes.UINT),
-                ("uFlags", wintypes.UINT),
-                ("uCallbackMessage", wintypes.UINT),
-                ("hIcon", wintypes.HICON),
-                ("szTip", wintypes.WCHAR * 128),
-                ("dwState", wintypes.DWORD),
-                ("dwStateMask", wintypes.DWORD),
-                ("szInfo", wintypes.WCHAR * 256),
-                ("uTimeout", wintypes.UINT),
-                ("szInfoTitle", wintypes.WCHAR * 64),
-                ("dwInfoFlags", wintypes.DWORD),
-            ]
-
-        nid_data = NOTIFYICONDATA()
-        nid_data.cbSize = ctypes.sizeof(NOTIFYICONDATA)
-        nid_data.hWnd = nid[0]
-        nid_data.uID = nid[1]
-        nid_data.uFlags = nid[2]
-        nid_data.uCallbackMessage = nid[3]
-        nid_data.hIcon = nid[4]
-        tip = nid[5] if len(nid) > 5 else ""
-        nid_data.szTip = tip[:127]
-        return nid_data
-
-    def _show_popup_menu(self):
-        """显示右键弹出菜单（含每人显隐勾选 + 退出）。"""
-        try:
-            menu = win32gui.CreatePopupMenu()
-
-            with self._lock:
-                for i, pet in enumerate(self.pets):
-                    label = pet.label
-                    checked = pet.visible
-                    flags = win32con.MF_STRING
-                    if checked:
-                        flags |= win32con.MF_CHECKED
-                    else:
-                        flags |= win32con.MF_UNCHECKED
-                    win32gui.AppendMenu(menu, flags, self.IDM_FIRST_TOGGLE + i, label)
-
-            # 分隔线
-            win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
-
-            # 退出
-            win32gui.AppendMenu(menu, win32con.MF_STRING, self.IDM_QUIT, "退出")
-
-            # 显示菜单
-            # 注意：使用 TPM_RETURNCMD 时，TrackPopupMenu 直接返回被选中项的 ID，
-            # 不会向窗口发送 WM_COMMAND。因此必须在此处处理返回值，否则菜单点击无反应。
-            pos = win32api.GetCursorPos()
-            win32gui.SetForegroundWindow(self.hwnd)
-            cmd = win32gui.TrackPopupMenu(
-                menu,
-                win32con.TPM_RIGHTBUTTON | win32con.TPM_RETURNCMD,
-                pos[0], pos[1],
-                0, self.hwnd, None
-            )
-            win32gui.PostMessage(self.hwnd, win32con.WM_NULL, 0, 0)
-            win32gui.DestroyMenu(menu)
-
-            # 直接派发命令（通过回调调度到主线程执行，避免 tkinter 跨线程崩溃）
-            if cmd == self.IDM_QUIT:
-                self.on_quit()
-            elif self.IDM_FIRST_TOGGLE <= cmd < self.IDM_QUIT:
-                idx = cmd - self.IDM_FIRST_TOGGLE
-                if self.on_toggle:
-                    self.on_toggle(idx)
-
-        except Exception as e:
-            print(f"[Tray] Menu error: {e}")
 
 
 # ============================================================
@@ -793,18 +634,18 @@ class MatePawApp:
             except Exception as e:
                 print(f"[Pet] 跳过人物 {cid}: {e}")
 
-    # ---- 原生系统托盘图标 ----
+    # ---- 系统托盘图标（pystray）----
     def _setup_tray_icon(self):
-        """创建原生 win32 系统托盘图标，菜单含每人显隐开关 + 退出。"""
+        """创建基于 pystray 的系统托盘图标，菜单含每人显隐开关 + 退出。"""
         try:
-            self.tray = NativeTrayIcon(
+            self.tray = PystrayTrayIcon(
                 pets=self.pets,
                 on_quit_callback=lambda: self.root.after(0, self._on_close),
                 on_toggle_callback=self._on_tray_toggle,
             )
             self.tray.start()
         except Exception as e:
-            print(f"[Tray] ERROR starting native tray: {e}")
+            print(f"[Tray] ERROR starting pystray tray: {e}")
 
     def _on_tray_toggle(self, idx):
         """托盘菜单切换人物显隐——从托盘线程调用，调度到主线程执行。"""
