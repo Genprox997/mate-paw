@@ -5,6 +5,7 @@
   "bob_amp": 6,
   "bob_speed": 0.18,
   "scale_range": 0.025,
+  "photo_cache_max": 384,
   "bubble_font_size": 34,
   "bubble_duration_ms": 2500,
   "crawl_speed_min": 1.5,
