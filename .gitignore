@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .eggs/
+.pytest_cache/
 
 # ----- 虚拟环境 -----
 .venv/

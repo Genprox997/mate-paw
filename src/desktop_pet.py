@@ -13,9 +13,6 @@
 
 import tkinter as tk
 from PIL import Image, ImageTk, ImageDraw, ImageFont
-import win32gui
-import win32con
-import win32api
 import random
 import math
 import os
@@ -25,8 +22,24 @@ import json
 import queue
 import threading
 import ctypes
-from ctypes import wintypes
 import logging
+from platform_win import (
+    HAS_WIN32,
+    get_screen_size,
+    find_pet_window,
+    set_layered_tool_window,
+    set_window_region,
+    set_window_region_fullscreen,
+    enum_window_rects,
+    install_mouse_hook,
+    uninstall_mouse_hook,
+    MSLLHOOKSTRUCT,
+    WM_LBUTTONDOWN,
+    WM_LBUTTONUP,
+    WM_MOUSEMOVE,
+    WM_RBUTTONDOWN,
+    WM_RBUTTONUP,
+)
 
 import pystray
 
@@ -108,35 +121,8 @@ def state_path():
     return os.path.join(os.path.dirname(default_config_path()), "state.json")
 
 # ============================================================
-# 全局鼠标钩子 (ctypes)
-# ============================================================
-WH_MOUSE_LL = 14
-WM_LBUTTONDOWN = 0x0201
-WM_LBUTTONUP = 0x0202
-WM_MOUSEMOVE = 0x0200
-WM_RBUTTONDOWN = 0x0204
-WM_RBUTTONUP = 0x0205
-
-user32 = ctypes.windll.user32
-
-
-class MSLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("pt", wintypes.POINT),
-        ("mouseData", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG)),
-    ]
-
-
-HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
-
-# ============================================================
 # 工具函数
 # ============================================================
-def get_screen_size():
-    return win32api.GetSystemMetrics(0), win32api.GetSystemMetrics(1)
 
 
 def get_resource_path(relative_path):
@@ -219,33 +205,8 @@ def get_window_rects(cache_ttl=2.0):
     if cache is not None and now - get_window_rects._cache_time < cache_ttl:
         return cache
 
-    screen_w = get_screen_size()[0]
-    screen_h = get_screen_size()[1]
-    our_title = 'mate_paw'
-    rects = []
-
-    def enum_cb(hwnd, _):
-        try:
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            title = win32gui.GetWindowText(hwnd)
-            if not title or title == our_title:
-                return True
-            rect = win32gui.GetWindowRect(hwnd)
-            left, top, right, bottom = rect
-            w, h = right - left, bottom - top
-            if w < 80 or h < 60:
-                return True
-            if w >= 0.9 * screen_w and h >= 0.9 * screen_h:
-                return True
-            if (w >= 0.9 * screen_w and h <= 60) or (h >= 0.9 * screen_h and w <= 60):
-                return True
-            rects.append((left, top, right, bottom))
-        except Exception:
-            pass
-        return True
-
-    win32gui.EnumWindows(enum_cb, None)
+    screen_w, screen_h = get_screen_size()
+    rects = enum_window_rects(screen_w, screen_h, 'mate_paw')
     get_window_rects._cache = rects
     get_window_rects._cache_time = now
     return rects
@@ -725,7 +686,6 @@ class MatePawApp:
         self.mouse_q = queue.Queue()
         self.drag = None
         self._hook = None
-        self._hook_running = True
         self.tray = None
         self.hwnd = None  # 主窗口句柄，用于 SetWindowRgn
         self.paused = False  # 全局暂停：宠物停止爬行但保持显示/呼吸
@@ -742,10 +702,8 @@ class MatePawApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind('<Escape>', lambda e: self._on_close())
 
-        # 全局鼠标钩子
-        self._hook_proc_cb = HOOKPROC(self._hook_proc_impl)
-        self._hook_thread = threading.Thread(target=self._hook_thread, daemon=True)
-        self._hook_thread.start()
+        # 全局鼠标钩子（仅用于屏蔽右键系统菜单；左键拖动走 canvas + SetWindowRgn）
+        self._hook, self._hook_thread, self._hook_proc_cb = install_mouse_hook(self._hook_proc_impl)
 
         self._animate()
 
@@ -758,17 +716,15 @@ class MatePawApp:
         self.root.title(self.WINDOW_TITLE)
 
         self.root.update_idletasks()
-        hwnd = win32gui.FindWindow(None, self.WINDOW_TITLE)
+        hwnd = find_pet_window(self.WINDOW_TITLE)
         self.hwnd = hwnd
         if hwnd:
             try:
-                ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
                 # 不加 WS_EX_TRANSPARENT：之前用 WH_MOUSE_LL 钩子吞掉 LBUTTONDOWN 会让 Windows
                 # 进入"按键未释放"状态，导致下一次点击不再产生事件（卡死）。
                 # 现在改用 SetWindowRgn 把窗口限制为宠物矩形 —— 区域外点击直接穿透到桌面，
                 # 区域内由 canvas 事件处理拖动。
-                ex |= win32con.WS_EX_LAYERED | win32con.WS_EX_TOOLWINDOW
-                win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex)
+                set_layered_tool_window(hwnd)
             except Exception as e:
                 log.warning(f"Warning: style: {e}")
         # 初始 region：根据可见宠物集合随时更新
@@ -784,7 +740,7 @@ class MatePawApp:
         if not self.hwnd or self.drag:
             return
         try:
-            combined = win32gui.CreateRectRgn(0, 0, 0, 0)  # 空的初始 region
+            rects = []
             for pet in self.pets:
                 if not pet.visible:
                     continue
@@ -794,10 +750,8 @@ class MatePawApp:
                 y2 = min(self.screen_h, pet.y + SPRITE_H)
                 if x2 <= x1 or y2 <= y1:
                     continue
-                r = win32gui.CreateRectRgn(x1, y1, x2, y2)
-                # CombineRgn(目标, src1, src2, 操作) 把 r 合入 combined；RGN_OR=2
-                win32gui.CombineRgn(combined, combined, r, getattr(win32api, 'RGN_OR', 2))
-            win32gui.SetWindowRgn(self.hwnd, combined, True)
+                rects.append((x1, y1, x2, y2))
+            set_window_region(self.hwnd, rects)
         except Exception:
             # 失败回退到全屏 region（不损失功能，但点击可能落到桌面图标）
             self._set_window_region_fullscreen()
@@ -808,8 +762,7 @@ class MatePawApp:
         if not self.hwnd:
             return
         try:
-            full = win32gui.CreateRectRgn(0, 0, self.screen_w, self.screen_h)
-            win32gui.SetWindowRgn(self.hwnd, full, True)
+            set_window_region_fullscreen(self.hwnd, self.screen_w, self.screen_h)
         except Exception:
             pass
 
@@ -1007,13 +960,6 @@ class MatePawApp:
             log.error("打开关于失败: %s", e)
 
     # ---- 鼠标钩子 ----
-    def _hook_thread(self):
-        self._hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._hook_proc_cb, None, 0)
-        msg = wintypes.MSG()
-        while self._hook_running and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-
     def _hook_proc_impl(self, nCode, wParam, lParam):
         """
         低级鼠标钩子（仅用于屏蔽右键系统菜单）。
@@ -1080,7 +1026,6 @@ class MatePawApp:
             self._save_state()
         except Exception:
             pass
-        self._hook_running = False
         try:
             if self.tray:
                 self.tray.stop()
@@ -1088,8 +1033,7 @@ class MatePawApp:
             pass
         try:
             if self._hook:
-                user32.UnhookWindowsHookEx(self._hook)
-            user32.PostQuitMessage(0)
+                uninstall_mouse_hook(self._hook)
         except Exception:
             pass
         try:
