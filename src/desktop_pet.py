@@ -21,6 +21,7 @@ import math
 import os
 import sys
 import time
+import json
 import queue
 import threading
 import ctypes
@@ -99,6 +100,11 @@ def setup_logging(level_name: str = "INFO") -> None:
 
 # 导入即应用一次配置（同时完成日志初始化），保证任何位置的 log 调用都有去处
 apply_config(CONFIG)
+
+
+def state_path():
+    """状态文件路径：与 config.json 同目录（exe 目录或 cwd），记录每只宠物位置/显隐/姿态。"""
+    return os.path.join(os.path.dirname(default_config_path()), "state.json")
 
 # ============================================================
 # 全局鼠标钩子 (ctypes)
@@ -670,6 +676,7 @@ class MatePawApp:
         self.tray = None
         self.hwnd = None  # 主窗口句柄，用于 SetWindowRgn
         self.paused = False  # 全局暂停：宠物停止爬行但保持显示/呼吸
+        self.state_path = state_path()  # 状态持久化文件路径
         # 鼠标钩子内用于跟踪是否吞掉右键事件（仅由钩子线程读写，避免竞态）
         self._r_block = False
 
@@ -797,11 +804,13 @@ class MatePawApp:
             pass
         # 拖动结束，恢复成"只覆盖宠物矩形"的 region（外面点击重新穿透到桌面）
         self._update_window_region()
+        self._save_state()
 
     def _on_canvas_btn3_press(self, event):
         pet = self._pet_at(event.x_root, event.y_root)
         if pet:
             pet.next_pose()
+            self._save_state()
         return 'break'  # 阻止 canvas 把事件传到别处（在我们的 SetWindowRgn 方案里这层通常不会触发）
 
     def _on_canvas_btn1_double(self, event):
@@ -819,6 +828,7 @@ class MatePawApp:
 
     def _load_pets(self):
         self.pets = []
+        self._state = self._load_state()
         res_dir = get_res_dir()
 
         if not os.path.isdir(res_dir):
@@ -840,6 +850,16 @@ class MatePawApp:
             char_dir = os.path.join(res_dir, cid)
             try:
                 pet = MatePaw(self.canvas, char_dir, cid, cid, self.screen_w, self.screen_h)
+                # 恢复上次的位置 / 显隐 / 姿态
+                st = self._state.get(cid)
+                if st:
+                    pet.x = min(max(int(st.get('x', pet.x)), 0), max(0, self.screen_w - SPRITE_W))
+                    pet.y = min(max(int(st.get('y', pet.y)), 0), max(0, self.screen_h - SPRITE_H))
+                    if 'visible' in st:
+                        pet.set_visible(bool(st['visible']))
+                    pi = int(st.get('pose_index', 0))
+                    if 0 <= pi < pet.pose_count:
+                        pet.pose_index = pi
                 self.pets.append(pet)
                 log.info(f"[Pet] 已加载人物 {cid}（共 {pet.pose_count} 个姿态）")
             except Exception as e:
@@ -873,6 +893,36 @@ class MatePawApp:
             pet.set_visible(not pet.visible)
             # 显隐变化后立即同步窗口可点区域（隐藏的宠物不应该再接住点击）
             self._update_window_region()
+            self._save_state()
+
+    def _load_state(self):
+        """读取状态文件，返回 {char_id: {x,y,visible,pose_index}}。"""
+        try:
+            if os.path.isfile(self.state_path):
+                with open(self.state_path, encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and isinstance(data.get('pets'), dict):
+                    return data['pets']
+        except Exception as e:
+            log.warning("读取状态失败: %s", e)
+        return {}
+
+    def _save_state(self):
+        """把每只宠物的位置/显隐/姿态写入状态文件。"""
+        try:
+            data = {
+                "version": 1,
+                "pets": {
+                    p.char_id: {
+                        "x": int(p.x), "y": int(p.y),
+                        "visible": p.visible, "pose_index": p.pose_index,
+                    } for p in self.pets
+                },
+            }
+            with open(self.state_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.error("保存状态失败: %s", e)
 
     def _toggle_pause_all(self):
         """托盘“暂停全部/恢复全部”触发：切换全局暂停标志。"""
@@ -956,6 +1006,7 @@ class MatePawApp:
             pet = self._pet_at(x, y)
             if pet:
                 pet.next_pose()
+                self._save_state()
 
     def _animate(self):
         try:
@@ -971,6 +1022,11 @@ class MatePawApp:
         self.root.after(UPDATE_MS, self._animate)
 
     def _on_close(self):
+        # 退出前保存状态（位置/显隐/姿态），下次启动恢复
+        try:
+            self._save_state()
+        except Exception:
+            pass
         self._hook_running = False
         try:
             if self.tray:
