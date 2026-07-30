@@ -13,6 +13,7 @@ env/
 # ----- PyInstaller 构建产物 -----
 build/
 dist/
+mate-paw/
 
 # ----- AI 助手内部数据（非项目源码）-----
 .workbuddy/
@@ -25,3 +26,8 @@ assets/
 .idea/
 *.swp
 Thumbs.db
+
+# ----- 姿势生成流水线中间产物（运行期生成，无需提交）-----
+pose_pipeline/stage1/
+pose_pipeline/stage2/
+*.pt
