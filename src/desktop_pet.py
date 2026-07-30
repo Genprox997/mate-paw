@@ -169,18 +169,42 @@ def get_res_dir():
     return os.path.join(os.getcwd(), 'res')
 
 
-def remove_light_bg(im, threshold=248):
-    """温和背景清除：只移除纯白/近白像素（RGB均>threshold），不伤人物内容"""
+def chroma_key(im, tolerance=None):
+    """色键去背景：采样四角+四边中点作为背景色，移除与之接近的像素。
+
+    与旧 remove_light_bg（固定阈值 248 会误删白色衣服）不同：
+      - 仅对不透明像素判定，透明 PNG（如 rembg 产出）直接跳过，前景白衣服得以保留；
+      - 背景色取自图片边缘采样的中位数，适配任意背景色，而非只认纯白。
+    tolerance 为 RGB 欧氏距离阈值，默认取 CONFIG.chroma_tolerance。
+    """
     if im.mode != 'RGBA':
         im = im.convert('RGBA')
-    data = im.load()
+    if tolerance is None:
+        tolerance = CONFIG.chroma_tolerance
     w, h = im.size
+    px = im.load()
+    # 边缘采样点：四角 + 四边中点
+    pts = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1),
+           (w // 2, 0), (0, h // 2), (w - 1, h // 2), (w // 2, h - 1)]
+    rs = [px[x, y][0] for (x, y) in pts if px[x, y][3] > 10]
+    gs = [px[x, y][1] for (x, y) in pts if px[x, y][3] > 10]
+    bs = [px[x, y][2] for (x, y) in pts if px[x, y][3] > 10]
+    if not rs:
+        return im  # 边缘全透明：已是透明图，无需处理（白衣服等前景保留）
+    br = sorted(rs)[len(rs) // 2]
+    bg = sorted(gs)[len(gs) // 2]
+    bb = sorted(bs)[len(bs) // 2]
+    out = im.copy()
+    op = out.load()
+    t2 = tolerance * tolerance
     for y in range(h):
         for x in range(w):
-            r, g, b, a = data[x, y]
-            if int(r) > threshold and int(g) > threshold and int(b) > threshold:
-                data[x, y] = (r, g, b, 0)
-    return im
+            r, g, b, a = op[x, y]
+            if a == 0:
+                continue
+            if (r - br) ** 2 + (g - bg) ** 2 + (b - bb) ** 2 <= t2:
+                op[x, y] = (r, g, b, 0)
+    return out
 
 
 def get_window_rects(cache_ttl=2.0):
@@ -420,29 +444,33 @@ class MatePaw:
         self.screen_w = screen_w
         self.screen_h = screen_h
 
-        # 加载该人物目录下所有动作姿态（按文件名排序，第一个为默认姿态）
-        self.pose_images = []
+        # 加载动作姿态：
+        #   - 目录下的图片文件 = 单帧姿态（按文件名排序，第一个为默认姿态）
+        #   - 子目录 = 多帧姿态，目录内图片按文件名排序为帧序列（动画播放）
+        self.poses = []           # poses[pose][frame] -> PIL.Image(RGBA, 已缩放)
+        self.frame_index = 0      # 当前姿态内的帧序号
+        self._frame_accum = 0     # 帧动画计时累加器
         try:
-            file_names = sorted(
-                f for f in os.listdir(char_dir)
-                if os.path.splitext(f)[1].lower() in IMAGE_EXTS
-            )
+            entries = sorted(os.listdir(char_dir))
         except OSError:
-            file_names = []
-        for fn in file_names:
-            p = os.path.join(char_dir, fn)
-            if os.path.isfile(p):
-                try:
-                    img = Image.open(p).convert('RGBA')
-                    img = remove_light_bg(img)
-                    img = img.resize((SPRITE_W, SPRITE_H), Image.LANCZOS)
-                    self.pose_images.append(img)
-                except Exception as e:
-                    log.warning(f"[Pet {char_id}] 跳过无法加载的图片 {fn}: {e}")
-        if not self.pose_images:
+            entries = []
+        for name in entries:
+            p = os.path.join(char_dir, name)
+            try:
+                if os.path.isfile(p) and os.path.splitext(name)[1].lower() in IMAGE_EXTS:
+                    self.poses.append([self._load_sprite(p)])
+                elif os.path.isdir(p):
+                    frames = [self._load_sprite(os.path.join(p, fn))
+                              for fn in sorted(os.listdir(p))
+                              if os.path.splitext(fn)[1].lower() in IMAGE_EXTS]
+                    if frames:
+                        self.poses.append(frames)
+            except Exception as e:
+                log.warning(f"[Pet {char_id}] 跳过无法加载的条目 {name}: {e}")
+        if not self.poses:
             raise RuntimeError(f"人物目录中没有任何可用图片: {char_dir}")
         self.pose_index = 0
-        self.pose_count = len(self.pose_images)
+        self.pose_count = len(self.poses)
 
         margin = 120
         self.x = random.randint(margin, max(margin, screen_w - SPRITE_W - margin))
@@ -460,7 +488,7 @@ class MatePaw:
         self.dragging = False
         self.visible = True
 
-        self.photo = ImageTk.PhotoImage(self.pose_images[0])
+        self.photo = ImageTk.PhotoImage(self.poses[0][0])
         self.img_id = canvas.create_image(
             self.x + SPRITE_W // 2, self.y + SPRITE_H // 2,
             image=self.photo, anchor='center', tags='pet'
@@ -508,6 +536,7 @@ class MatePaw:
                     self._enter_state('crawling')
 
             self.bob_phase += BOB_SPEED
+            self._advance_frame()
             self._render()
         except Exception as e:
             log.error(f"[Pet {self.label}] update error: {e}")
@@ -574,14 +603,32 @@ class MatePaw:
     def next_pose(self):
         if self.pose_count > 1:
             self.pose_index = (self.pose_index + 1) % self.pose_count
+            self.frame_index = 0  # 切换姿态从头帧开始
 
     def set_visible(self, v):
         self.visible = v
         if not v:
             self.canvas.itemconfig(self.img_id, state='hidden')
 
+    def _load_sprite(self, path):
+        """加载单张精灵：转 RGBA -> 色键去背景 -> 缩放到标准尺寸。"""
+        img = Image.open(path).convert('RGBA')
+        img = chroma_key(img)
+        return img.resize((SPRITE_W, SPRITE_H), Image.LANCZOS)
+
+    def _advance_frame(self):
+        """推进当前姿态内的动画帧（多帧姿态才动；单帧姿态不动）。"""
+        frames = self.poses[self.pose_index]
+        if len(frames) <= 1:
+            return
+        anim_step = max(2, FPS // 8)  # 约 8fps 的动画速度
+        self._frame_accum += 1
+        if self._frame_accum >= anim_step:
+            self._frame_accum = 0
+            self.frame_index = (self.frame_index + 1) % len(frames)
+
     def _render(self):
-        base = self.pose_images[self.pose_index]
+        base = self.poses[self.pose_index][self.frame_index]
         if self.facing_right:
             display = base.copy()
         else:
