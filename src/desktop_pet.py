@@ -29,35 +29,47 @@ import logging
 
 import pystray
 
-from config import load_config, APP_VERSION
+from config import load_config, APP_VERSION, default_config_path, Config
 
 # ============================================================
 # 配置（来自 config.json，带默认值回退，见 src/config.py）
 # ============================================================
 CONFIG, CONFIG_SOURCE = load_config()
 
-SPRITE_W = CONFIG.sprite_w
-SPRITE_H = CONFIG.sprite_h
-FPS = CONFIG.fps
-UPDATE_MS = 1000 // FPS
-BOB_AMP = CONFIG.bob_amp
-BOB_SPEED = CONFIG.bob_speed
-SCALE_RANGE = CONFIG.scale_range
 
-# 气泡对话（如"叫爸爸"）
-BUBBLE_FONT_SIZE = CONFIG.bubble_font_size
-BUBBLE_DURATION_MS = CONFIG.bubble_duration_ms
+def apply_config(cfg):
+    """把配置值同步到模块级常量；设置面板改完调用它即可实时生效。"""
+    global SPRITE_W, SPRITE_H, FPS, UPDATE_MS, BOB_AMP, BOB_SPEED, SCALE_RANGE, \
+        BUBBLE_FONT_SIZE, BUBBLE_DURATION_MS, CRAWL_SPEED_MIN, CRAWL_SPEED_MAX, \
+        PAUSE_CHANCE, LOOK_CHANCE, PAUSE_DURATION, LOOK_DURATION, DIR_CHANGE_CHANCE
+    SPRITE_W = cfg.sprite_w
+    SPRITE_H = cfg.sprite_h
+    FPS = cfg.fps
+    UPDATE_MS = 1000 // FPS
+    BOB_AMP = cfg.bob_amp
+    BOB_SPEED = cfg.bob_speed
+    SCALE_RANGE = cfg.scale_range
+    BUBBLE_FONT_SIZE = cfg.bubble_font_size
+    BUBBLE_DURATION_MS = cfg.bubble_duration_ms
+    CRAWL_SPEED_MIN = cfg.crawl_speed_min
+    CRAWL_SPEED_MAX = cfg.crawl_speed_max
+    PAUSE_CHANCE = cfg.pause_chance
+    LOOK_CHANCE = cfg.look_chance
+    PAUSE_DURATION = tuple(cfg.pause_duration)
+    LOOK_DURATION = tuple(cfg.look_duration)
+    DIR_CHANGE_CHANCE = cfg.dir_change_chance
+    setup_logging(cfg.log_level)
 
-# 支持的动作姿态图片格式
+
+def set_config(cfg):
+    """替换全局 CONFIG 并应用（设置对话框保存时调用）。"""
+    global CONFIG
+    CONFIG = cfg
+    apply_config(cfg)
+
+
+# 支持的动作姿态图片格式（常量，不随配置变化）
 IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.tif', '.tiff')
-
-CRAWL_SPEED_MIN = CONFIG.crawl_speed_min
-CRAWL_SPEED_MAX = CONFIG.crawl_speed_max
-PAUSE_CHANCE = CONFIG.pause_chance
-LOOK_CHANCE = CONFIG.look_chance
-PAUSE_DURATION = tuple(CONFIG.pause_duration)
-LOOK_DURATION = tuple(CONFIG.look_duration)
-DIR_CHANGE_CHANCE = CONFIG.dir_change_chance
 
 # ============================================================
 # 日志（替代散落的 print；打包后额外写文件到 %APPDATA%/mate_paw）
@@ -85,8 +97,8 @@ def setup_logging(level_name: str = "INFO") -> None:
     log.setLevel(level)
 
 
-# 导入即配置一次，保证任何位置的 log 调用都有去处
-setup_logging(CONFIG.log_level)
+# 导入即应用一次配置（同时完成日志初始化），保证任何位置的 log 调用都有去处
+apply_config(CONFIG)
 
 # ============================================================
 # 全局鼠标钩子 (ctypes)
@@ -248,19 +260,51 @@ def make_tray_icon_image(size=64):
 class PystrayTrayIcon:
     """使用 pystray 实现的系统托盘图标，菜单含每人显隐开关 + 退出。"""
 
-    def __init__(self, pets, on_quit_callback, on_toggle_callback=None):
+    def __init__(self, pets, on_quit_callback, on_toggle_callback=None,
+                 on_pause_callback=None, on_settings_callback=None,
+                 on_about_callback=None, get_paused_callback=None):
         """
         pets: list of MatePaw 对象（需要有 .label 和 .visible 属性）
         on_quit_callback: 退出回调函数（由 pystray 在后台线程调用，应自行调度到主线程）
         on_toggle_callback: 切换人物显隐的回调，参数为人物在 pets 列表中的索引
+        on_pause_callback / on_settings_callback / on_about_callback: 对应菜单动作
+        get_paused_callback: 返回当前是否全局暂停（用于菜单项文案）
         """
         self.pets = pets
         self.on_quit = on_quit_callback
         self.on_toggle = on_toggle_callback
+        self.on_pause = on_pause_callback
+        self.on_settings = on_settings_callback
+        self.on_about = on_about_callback
+        self.get_paused = get_paused_callback
         self.icon = None
 
+    def _is_paused(self):
+        try:
+            return bool(self.get_paused()) if self.get_paused else False
+        except Exception:
+            return False
+
+    def _on_pause(self, *args):
+        if self.on_pause:
+            self.on_pause()
+        # 切换后刷新菜单文案（恢复/暂停）
+        try:
+            if self.icon is not None:
+                self.icon.update_menu()
+        except Exception:
+            pass
+
+    def _on_settings(self, *args):
+        if self.on_settings:
+            self.on_settings()
+
+    def _on_about(self, *args):
+        if self.on_about:
+            self.on_about()
+
     def _build_menu(self):
-        """构建托盘右键菜单：每人一个带勾选状态的显隐开关 + 退出。
+        """构建托盘右键菜单：每人显隐开关 + 暂停/恢复 + 设置 + 关于 + 退出。
 
         pystray 的 checked 回调在每次展开菜单时求值，因此勾选状态始终反映
         当前 pet.visible，无需手动刷新菜单。
@@ -278,6 +322,13 @@ class PystrayTrayIcon:
                     checked=lambda item, i=i: self.pets[i].visible,
                 )
             )
+        # 全局暂停 / 恢复（文案随状态变化）
+        items.append(pystray.MenuItem(
+            text=lambda item: '恢复全部' if self._is_paused() else '暂停全部',
+            action=lambda *_args: self._on_pause(),
+        ))
+        items.append(pystray.MenuItem('设置…', lambda *_args: self._on_settings()))
+        items.append(pystray.MenuItem('关于', lambda *_args: self._on_about()))
         items.append(pystray.MenuItem('退出', self._on_quit))
         return pystray.Menu(*items)
 
@@ -416,7 +467,7 @@ class MatePaw:
         self.bubble_w = 0
         self.bubble_h = 0
 
-    def update(self):
+    def update(self, paused=False):
         try:
             if not self.visible:
                 self.canvas.itemconfig(self.img_id, state='hidden')
@@ -425,6 +476,11 @@ class MatePaw:
             self.canvas.itemconfig(self.img_id, state='normal')
 
             if self.dragging:
+                self._render()
+                return
+
+            if paused:
+                self.bob_phase += BOB_SPEED
                 self._render()
                 return
 
@@ -613,6 +669,7 @@ class MatePawApp:
         self._hook_running = True
         self.tray = None
         self.hwnd = None  # 主窗口句柄，用于 SetWindowRgn
+        self.paused = False  # 全局暂停：宠物停止爬行但保持显示/呼吸
         # 鼠标钩子内用于跟踪是否吞掉右键事件（仅由钩子线程读写，避免竞态）
         self._r_block = False
 
@@ -790,12 +847,16 @@ class MatePawApp:
 
     # ---- 系统托盘图标（pystray）----
     def _setup_tray_icon(self):
-        """创建基于 pystray 的系统托盘图标，菜单含每人显隐开关 + 退出。"""
+        """创建基于 pystray 的系统托盘图标，菜单含每人显隐开关 + 暂停/设置/关于 + 退出。"""
         try:
             self.tray = PystrayTrayIcon(
                 pets=self.pets,
                 on_quit_callback=lambda: self.root.after(0, self._on_close),
                 on_toggle_callback=self._on_tray_toggle,
+                on_pause_callback=lambda: self.root.after(0, self._toggle_pause_all),
+                on_settings_callback=lambda: self.root.after(0, self._open_settings),
+                on_about_callback=lambda: self.root.after(0, self._open_about),
+                get_paused_callback=lambda: self.paused,
             )
             self.tray.start()
         except Exception as e:
@@ -812,6 +873,35 @@ class MatePawApp:
             pet.set_visible(not pet.visible)
             # 显隐变化后立即同步窗口可点区域（隐藏的宠物不应该再接住点击）
             self._update_window_region()
+
+    def _toggle_pause_all(self):
+        """托盘“暂停全部/恢复全部”触发：切换全局暂停标志。"""
+        self.paused = not self.paused
+        log.info("全局%s", "已暂停" if self.paused else "已恢复")
+
+    def _apply_settings(self, cfg):
+        """设置对话框“应用并保存”的回调：应用配置并落盘 config.json。"""
+        try:
+            set_config(cfg)
+            path = default_config_path()
+            cfg.save(path)
+            log.info("设置已保存: %s", path)
+        except Exception as e:
+            log.error("保存设置失败: %s", e)
+
+    def _open_settings(self):
+        """打开设置对话框（主线程）。"""
+        try:
+            SettingsDialog(self.root, CONFIG, self._apply_settings)
+        except Exception as e:
+            log.error("打开设置失败: %s", e)
+
+    def _open_about(self):
+        """打开“关于”对话框（主线程）。"""
+        try:
+            AboutDialog(self.root)
+        except Exception as e:
+            log.error("打开关于失败: %s", e)
 
     # ---- 鼠标钩子 ----
     def _hook_thread(self):
@@ -875,7 +965,7 @@ class MatePawApp:
         except Exception:
             pass
         for pet in self.pets:
-            pet.update()
+            pet.update(self.paused)
         # 让窗口 region 跟随可见宠物的位置一起移动（拖动中由 fullscreen 接管，会跳过）
         self._update_window_region()
         self.root.after(UPDATE_MS, self._animate)
@@ -902,6 +992,87 @@ class MatePawApp:
         log.info(f"[mate_paw] {len(self.pets)} pets on {self.screen_w}x{self.screen_h}")
         log.info("左键拖动 / 右键换姿态 / 双击喊爸爸 / 托盘图标开关人物 / Esc 退出")
         self.root.mainloop()
+
+
+class SettingsDialog:
+    """设置对话框：实时调节行为参数并落盘 config.json。"""
+
+    # (标签, 配置键, 最小值, 最大值, 步进)
+    SLIDERS = [
+        ("爬行速度下限", "crawl_speed_min", 0.5, 8.0, 0.1),
+        ("爬行速度上限", "crawl_speed_max", 0.5, 10.0, 0.1),
+        ("暂停概率", "pause_chance", 0.0, 0.05, 0.001),
+        ("张望概率", "look_chance", 0.0, 0.05, 0.001),
+        ("转向概率", "dir_change_chance", 0.0, 0.05, 0.001),
+        ("气泡时长(ms)", "bubble_duration_ms", 800, 6000, 100),
+    ]
+    LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
+
+    def __init__(self, parent, config, on_apply):
+        self.config = config
+        self.on_apply = on_apply
+        self.win = tk.Toplevel(parent)
+        self.win.title("mate-paw 设置")
+        self.win.attributes('-topmost', True)
+        self.win.resizable(False, False)
+        self.vars = {}
+        self._build()
+
+    def _build(self):
+        pad = {'padx': 8, 'pady': 4}
+        for i, (label, key, lo, hi, step) in enumerate(self.SLIDERS):
+            tk.Label(self.win, text=label).grid(row=i, column=0, sticky='w', **pad)
+            var = tk.DoubleVar(value=float(self.config.get(key)))
+            tk.Scale(self.win, variable=var, from_=lo, to=hi, resolution=step,
+                     orient='horizontal', length=200).grid(row=i, column=1, **pad)
+            self.vars[key] = var
+        r = len(self.SLIDERS)
+        tk.Label(self.win, text="日志等级").grid(row=r, column=0, sticky='w', **pad)
+        lv = tk.StringVar(value=str(self.config.get('log_level', 'INFO')))
+        tk.OptionMenu(self.win, lv, *self.LOG_LEVELS).grid(row=r, column=1, sticky='w', **pad)
+        self.vars['log_level'] = lv
+        btn_row = r + 1
+        tk.Button(self.win, text="应用并保存", command=self._do_apply).grid(row=btn_row, column=0, **pad)
+        tk.Button(self.win, text="取消", command=self.win.destroy).grid(row=btn_row, column=1, **pad)
+
+    def _collect(self):
+        data = self.config.to_dict()
+        for key, var in self.vars.items():
+            if key == 'log_level':
+                data[key] = var.get()
+            else:
+                val = var.get()
+                if key in ('bubble_duration_ms',):
+                    val = int(round(val))
+                data[key] = val
+        return data
+
+    def _do_apply(self):
+        data = self._collect()
+        cfg = Config(data)
+        # 简单合理性校验：速度上限不低于下限
+        if cfg.crawl_speed_max < cfg.crawl_speed_min:
+            cfg.crawl_speed_max = cfg.crawl_speed_min
+        self.on_apply(cfg)
+        self.win.destroy()
+
+
+class AboutDialog:
+    """“关于”对话框。"""
+
+    def __init__(self, parent):
+        self.win = tk.Toplevel(parent)
+        self.win.title("关于 mate-paw")
+        self.win.attributes('-topmost', True)
+        self.win.resizable(False, False)
+        info = (
+            f"mate-paw 桌面宠物  v{APP_VERSION}\n\n"
+            "多只在桌面爬行的人形猴子，可拖动 / 右键换姿态 /\n"
+            "双击喊爸爸 / 托盘开关人物。\n\n"
+            "仓库: github.com/Genprox997/mate-paw"
+        )
+        tk.Label(self.win, text=info, justify='left', padx=12, pady=12).pack()
+        tk.Button(self.win, text="关闭", command=self.win.destroy).pack(pady=(0, 12))
 
 
 def self_check() -> int:
