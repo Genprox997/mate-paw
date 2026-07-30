@@ -166,6 +166,11 @@ def get_res_dir():
         d = os.path.join(base, 'res')
         if os.path.isdir(d):
             return d
+    # 打包后若外部没有 res，回退到内嵌的默认资源（PyInstaller 解包到 _MEIPASS）
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        d = os.path.join(sys._MEIPASS, 'res')
+        if os.path.isdir(d):
+            return d
     # 未找到现成的 res，回退到 cwd/res 并交由调用方提示
     return os.path.join(os.getcwd(), 'res')
 

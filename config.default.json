@@ -1,0 +1,23 @@
+{
+  "fps": 30,
+  "sprite_w": 180,
+  "sprite_h": 260,
+  "bob_amp": 6,
+  "bob_speed": 0.18,
+  "scale_range": 0.025,
+  "bubble_font_size": 34,
+  "bubble_duration_ms": 2500,
+  "crawl_speed_min": 1.5,
+  "crawl_speed_max": 3.5,
+  "pause_chance": 0.006,
+  "look_chance": 0.004,
+  "pause_duration": [40, 120],
+  "look_duration": [50, 150],
+  "dir_change_chance": 0.012,
+  "log_level": "INFO",
+  "pause_all_on_start": false,
+  "follow_cursor": false,
+  "sound": false,
+  "bubble_lines": ["爸！", "你好呀~", "陪我玩", "吱吱", "摸摸我"],
+  "chroma_tolerance": 40
+}
