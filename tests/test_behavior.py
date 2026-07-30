@@ -152,3 +152,74 @@ def test_update_runs_without_error(char_dir, tk_canvas, monkeypatch):
     for _ in range(5):
         pet.update(paused=False)
     assert pet.state == 'crawling'
+
+
+# ---------------------------------------------------------------------------
+# D. 交互与体验 —— 纯函数 + 空闲气泡
+# ---------------------------------------------------------------------------
+def test_is_tap_small_move_short_time():
+    assert dp.is_tap(2, 1, 100) is True
+
+
+def test_is_tap_large_move():
+    assert dp.is_tap(50, 0, 100) is False
+
+
+def test_is_tap_long_time():
+    assert dp.is_tap(2, 1, 1000) is False
+
+
+def test_pick_phrase_empty():
+    assert dp.pick_phrase([]) == ""
+
+
+def test_pick_phrase_from_list():
+    phrases = ["a", "b", "c"]
+    assert dp.pick_phrase(phrases, rng=lambda p: p[1]) == "b"
+
+
+def test_idle_bubble_appears(char_dir, tk_canvas, monkeypatch):
+    pet = _new_pet(char_dir, tk_canvas)
+    # 强制空闲气泡必触发一次
+    monkeypatch.setattr(dp, 'IDLE_BUBBLE_CHANCE', 1.0)
+    monkeypatch.setattr(dp.random, 'random', lambda: 0.0)
+    pet.update(paused=False)
+    # 应当弹出一个气泡（bubble_until 在未来）
+    assert pet.bubble_until > time.time() - 1.0
+
+
+def test_react_called_on_shock_has_group(char_dir, tk_canvas):
+    pet = _new_pet(char_dir, tk_canvas)
+    pet.react('happy')  # happy 组在测试资源中存在
+    assert pet.current_group_name() == 'happy'
+
+
+# ---------------------------------------------------------------------------
+# 托盘菜单（D）：新增「显示全部 / 隐藏全部 / 戳一下」且回调可触发
+# ---------------------------------------------------------------------------
+class _FakePet:
+    def __init__(self, label, visible=True):
+        self.label = label
+        self.visible = visible
+
+
+def test_tray_menu_has_new_actions_and_callbacks():
+    calls = []
+    tray = dp.PystrayTrayIcon(
+        pets=[_FakePet('a'), _FakePet('b')],
+        on_quit_callback=lambda: calls.append('quit'),
+        on_show_all_callback=lambda: calls.append('show_all'),
+        on_hide_all_callback=lambda: calls.append('hide_all'),
+        on_poke_callback=lambda: calls.append('poke'),
+        get_paused_callback=lambda: False,
+    )
+    menu = tray._build_menu()
+    labels = [item.text for item in menu.items if isinstance(item.text, str)]
+    assert '显示全部' in labels
+    assert '隐藏全部' in labels
+    assert '戳一下' in labels
+    # 触发新动作回调（模拟菜单点击）
+    tray._on_show_all()
+    tray._on_hide_all()
+    tray._on_poke()
+    assert calls == ['show_all', 'hide_all', 'poke']

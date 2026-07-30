@@ -136,6 +136,18 @@ def facing_toward(from_x, target_x):
     return target_x >= from_x
 
 
+def is_tap(dx, dy, dt_ms, move_thresh=8, max_dt_ms=350):
+    """判断一次按下-释放是否为「轻点」（而非拖拽）：位移小且时间短。"""
+    return math.hypot(dx, dy) <= move_thresh and dt_ms <= max_dt_ms
+
+
+def pick_phrase(phrases, rng=random.choice):
+    """从语料里随机挑一句；语料为空返回空串。"""
+    if not phrases:
+        return ""
+    return rng(phrases)
+
+
 # 支持的动作姿态图片格式（常量，不随配置变化）
 IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.tif', '.tiff')
 
@@ -312,12 +324,15 @@ class PystrayTrayIcon:
 
     def __init__(self, pets, on_quit_callback, on_toggle_callback=None,
                  on_pause_callback=None, on_settings_callback=None,
-                 on_about_callback=None, get_paused_callback=None):
+                 on_about_callback=None, get_paused_callback=None,
+                 on_show_all_callback=None, on_hide_all_callback=None,
+                 on_poke_callback=None):
         """
         pets: list of MatePaw 对象（需要有 .label 和 .visible 属性）
         on_quit_callback: 退出回调函数（由 pystray 在后台线程调用，应自行调度到主线程）
         on_toggle_callback: 切换人物显隐的回调，参数为人物在 pets 列表中的索引
         on_pause_callback / on_settings_callback / on_about_callback: 对应菜单动作
+        on_show_all_callback / on_hide_all_callback / on_poke_callback: 全部显示/隐藏/戳一下
         get_paused_callback: 返回当前是否全局暂停（用于菜单项文案）
         """
         self.pets = pets
@@ -327,6 +342,9 @@ class PystrayTrayIcon:
         self.on_settings = on_settings_callback
         self.on_about = on_about_callback
         self.get_paused = get_paused_callback
+        self.on_show_all = on_show_all_callback
+        self.on_hide_all = on_hide_all_callback
+        self.on_poke = on_poke_callback
         self.icon = None
 
     def _is_paused(self):
@@ -377,6 +395,9 @@ class PystrayTrayIcon:
             text=lambda item: '恢复全部' if self._is_paused() else '暂停全部',
             action=lambda *_args: self._on_pause(),
         ))
+        items.append(pystray.MenuItem('显示全部', lambda *_args: self._on_show_all()))
+        items.append(pystray.MenuItem('隐藏全部', lambda *_args: self._on_hide_all()))
+        items.append(pystray.MenuItem('戳一下', lambda *_args: self._on_poke()))
         items.append(pystray.MenuItem('设置…', lambda *_args: self._on_settings()))
         items.append(pystray.MenuItem('关于', lambda *_args: self._on_about()))
         items.append(pystray.MenuItem('退出', self._on_quit))
@@ -386,6 +407,18 @@ class PystrayTrayIcon:
         """菜单点击切换人物显隐（在 pystray 后台线程中调用，经回调调度到主线程）。"""
         if self.on_toggle:
             self.on_toggle(idx)
+
+    def _on_show_all(self, *args):
+        if self.on_show_all:
+            self.on_show_all()
+
+    def _on_hide_all(self, *args):
+        if self.on_hide_all:
+            self.on_hide_all()
+
+    def _on_poke(self, *args):
+        if self.on_poke:
+            self.on_poke()
 
     def _on_quit(self, icon=None, item=None):
         """菜单点击退出。"""
@@ -573,6 +606,11 @@ class MatePaw:
             if self.state == 'looking' and FOLLOW_CURSOR and self.cursor_x is not None:
                 self.facing_right = facing_toward(
                     self.x + SPRITE_W / 2, self.cursor_x)
+
+            # 空闲随机气泡（D）：当前没有气泡显示时才按概率冒一句
+            if IDLE_BUBBLE_CHANCE > 0 and self.bubble_until < time.time():
+                if random.random() < IDLE_BUBBLE_CHANCE:
+                    self.say(pick_phrase(CONFIG.bubble_lines))
 
             self.bob_phase += BOB_SPEED
             self._advance_frame()
@@ -901,8 +939,15 @@ class MatePawApp:
         pet = self._pet_at(event.x_root, event.y_root)
         if not pet:
             return
-        self.drag = {'pet': pet, 'ox': event.x_root - pet.x, 'oy': event.y_root - pet.y}
+        # 记录按下信息，用于区分「轻点抚摸」与「拖拽」
+        self.drag = {
+            'pet': pet,
+            'ox': event.x_root - pet.x, 'oy': event.y_root - pet.y,
+            'start_x': event.x_root, 'start_y': event.y_root,
+            'start_t': time.time(),
+        }
         pet.dragging = True
+        pet.react('shock')  # 被抓住时受惊一下（资源有 shock 组才可见，否则仅逻辑生效）
         # 拖动期间 region 切到全屏，否则宠物跟随鼠标离开原区域后收不到后续事件
         self._set_window_region_fullscreen()
         try:
@@ -919,15 +964,27 @@ class MatePawApp:
         pet.y = min(max(event.y_root - self.drag['oy'], 0), self.screen_h - SPRITE_H)
 
     def _on_canvas_btn1_release(self, event):
-        if self.drag:
-            self.drag['pet'].dragging = False
-            self.drag = None
+        if not self.drag:
+            return
+        pet = self.drag['pet']
+        d = self.drag
+        pet.dragging = False
+        self.drag = None
         try:
             self.canvas.grab_release()
         except Exception:
             pass
         # 拖动结束，恢复成"只覆盖宠物矩形"的 region（外面点击重新穿透到桌面）
         self._update_window_region()
+        # 区分轻点与拖拽：位移小且短 -> 抚摸反应 + 气泡；否则是成功拖拽 -> 放下开心
+        dx = event.x_root - d['start_x']
+        dy = event.y_root - d['start_y']
+        dt_ms = (time.time() - d['start_t']) * 1000.0
+        if is_tap(dx, dy, dt_ms) and TAP_REACT:
+            pet.react('happy')
+            pet.say(pick_phrase(CONFIG.bubble_lines))
+        else:
+            pet.react('happy')
         self._save_state()
 
     def _on_canvas_btn3_press(self, event):
@@ -940,6 +997,7 @@ class MatePawApp:
     def _on_canvas_btn1_double(self, event):
         pet = self._pet_at(event.x_root, event.y_root)
         if pet:
+            pet.react('happy')
             pet.say("爸！")
         return 'break'
 
@@ -991,7 +1049,8 @@ class MatePawApp:
 
     # ---- 系统托盘图标（pystray）----
     def _setup_tray_icon(self):
-        """创建基于 pystray 的系统托盘图标，菜单含每人显隐开关 + 暂停/设置/关于 + 退出。"""
+        """创建基于 pystray 的系统托盘图标，菜单含每人显隐开关 + 显示/隐藏全部 +
+        戳一下 + 暂停/设置/关于 + 退出。"""
         try:
             self.tray = PystrayTrayIcon(
                 pets=self.pets,
@@ -1000,6 +1059,9 @@ class MatePawApp:
                 on_pause_callback=lambda: self.root.after(0, self._toggle_pause_all),
                 on_settings_callback=lambda: self.root.after(0, self._open_settings),
                 on_about_callback=lambda: self.root.after(0, self._open_about),
+                on_show_all_callback=lambda: self.root.after(0, self._show_all),
+                on_hide_all_callback=lambda: self.root.after(0, self._hide_all),
+                on_poke_callback=lambda: self.root.after(0, self._poke_all),
                 get_paused_callback=lambda: self.paused,
             )
             self.tray.start()
@@ -1132,11 +1194,38 @@ class MatePawApp:
                 self._handle_mouse(et, x, y)
         except Exception:
             pass
+        # 把光标屏幕 x 写入每只宠物（看向光标用）；无指针/不可取时置 None
+        try:
+            cx = self.root.winfo_pointerx()
+        except Exception:
+            cx = None
+        for pet in self.pets:
+            pet.cursor_x = cx if (cx is not None and cx >= 0) else None
         for pet in self.pets:
             pet.update(self.paused)
         # 让窗口 region 跟随可见宠物的位置一起移动（拖动中由 fullscreen 接管，会跳过）
         self._update_window_region()
         self.root.after(UPDATE_MS, self._animate)
+
+    def _show_all(self):
+        for pet in self.pets:
+            pet.set_visible(True)
+        self._update_window_region()
+        self._save_state()
+
+    def _hide_all(self):
+        for pet in self.pets:
+            pet.set_visible(False)
+        self._update_window_region()
+        self._save_state()
+
+    def _poke_all(self):
+        """戳一下全部宠物：受惊/开心反应 + 气泡。"""
+        for pet in self.pets:
+            if not pet.visible:
+                continue
+            pet.react('happy')
+            pet.say(POKE_BUBBLE)
 
     def _on_close(self):
         # 退出前保存状态（位置/显隐/姿态），下次启动恢复
@@ -1175,7 +1264,17 @@ class SettingsDialog:
         ("暂停概率", "pause_chance", 0.0, 0.05, 0.001),
         ("张望概率", "look_chance", 0.0, 0.05, 0.001),
         ("转向概率", "dir_change_chance", 0.0, 0.05, 0.001),
+        ("空闲概率", "idle_chance", 0.0, 0.01, 0.0001),
+        ("睡觉概率", "sleep_chance", 0.0, 0.005, 0.0001),
+        ("招手概率", "wave_chance", 0.0, 0.005, 0.0001),
+        ("眨眼概率", "blink_chance", 0.0, 0.02, 0.0005),
+        ("空闲气泡概率", "idle_bubble_chance", 0.0, 0.005, 0.0001),
         ("气泡时长(ms)", "bubble_duration_ms", 800, 6000, 100),
+    ]
+    # (标签, 配置键)
+    CHECKBOXES = [
+        ("跟随光标（空闲张望时）", "follow_cursor"),
+        ("点击抚摸反应", "tap_react"),
     ]
     LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
 
@@ -1198,11 +1297,18 @@ class SettingsDialog:
                      orient='horizontal', length=200).grid(row=i, column=1, **pad)
             self.vars[key] = var
         r = len(self.SLIDERS)
-        tk.Label(self.win, text="日志等级").grid(row=r, column=0, sticky='w', **pad)
+        # 复选框（跟随光标 / 点击抚摸）
+        for j, (label, key) in enumerate(self.CHECKBOXES):
+            var = tk.BooleanVar(value=bool(self.config.get(key, False)))
+            cb = tk.Checkbutton(self.win, text=label, variable=var)
+            cb.grid(row=r + j, column=0, columnspan=2, sticky='w', **pad)
+            self.vars[key] = var
+        r2 = r + len(self.CHECKBOXES)
+        tk.Label(self.win, text="日志等级").grid(row=r2, column=0, sticky='w', **pad)
         lv = tk.StringVar(value=str(self.config.get('log_level', 'INFO')))
-        tk.OptionMenu(self.win, lv, *self.LOG_LEVELS).grid(row=r, column=1, sticky='w', **pad)
+        tk.OptionMenu(self.win, lv, *self.LOG_LEVELS).grid(row=r2, column=1, sticky='w', **pad)
         self.vars['log_level'] = lv
-        btn_row = r + 1
+        btn_row = r2 + 1
         tk.Button(self.win, text="应用并保存", command=self._do_apply).grid(row=btn_row, column=0, **pad)
         tk.Button(self.win, text="取消", command=self.win.destroy).grid(row=btn_row, column=1, **pad)
 
