@@ -37,13 +37,25 @@ DEFAULTS = {
     "pause_duration": [40, 120],
     "look_duration": [50, 150],
     "dir_change_chance": 0.012,
+    # 空闲 / 随机行为（C：行为丰富度）
+    "idle_chance": 0.0008,
+    "idle_duration": [60, 160],
+    "sleep_chance": 0.0004,
+    "sleep_duration": [600, 1800],
+    "wave_chance": 0.0004,
+    "wave_duration": [40, 90],
+    "blink_chance": 0.0015,
+    "blink_duration": [6, 14],
     # 运行时
     "log_level": "INFO",
-    # 预留（后续步骤启用）：全局暂停 / 跟随光标 / 音效 / 空闲气泡语料
+    # 交互与体验（D）
     "pause_all_on_start": False,
     "follow_cursor": False,
+    "idle_bubble_chance": 0.0006,
+    "tap_react": True,
+    "poke_bubble": "喂！",
     "sound": False,
-    "bubble_lines": ["爸！", "你好呀~", "陪我玩", "吱吱", "摸摸我"],
+    "bubble_lines": ["爸！", "你好呀~", "陪我玩", "吱吱", "摸摸我", "好痒", "嘻嘻"],
     # 抠图色键容差（四角采样色键方案，见 desktop_pet.chroma_key）
     "chroma_tolerance": 40,
 }

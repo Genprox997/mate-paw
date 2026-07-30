@@ -56,7 +56,10 @@ def apply_config(cfg):
     """把配置值同步到模块级常量；设置面板改完调用它即可实时生效。"""
     global SPRITE_W, SPRITE_H, FPS, UPDATE_MS, BOB_AMP, BOB_SPEED, SCALE_RANGE, \
         BUBBLE_FONT_SIZE, BUBBLE_DURATION_MS, CRAWL_SPEED_MIN, CRAWL_SPEED_MAX, \
-        PAUSE_CHANCE, LOOK_CHANCE, PAUSE_DURATION, LOOK_DURATION, DIR_CHANGE_CHANCE
+        PAUSE_CHANCE, LOOK_CHANCE, PAUSE_DURATION, LOOK_DURATION, DIR_CHANGE_CHANCE, \
+        IDLE_CHANCE, IDLE_DURATION, SLEEP_CHANCE, SLEEP_DURATION, WAVE_CHANCE, \
+        WAVE_DURATION, BLINK_CHANCE, BLINK_DURATION, IDLE_BUBBLE_CHANCE, \
+        FOLLOW_CURSOR, TAP_REACT, POKE_BUBBLE
     SPRITE_W = cfg.sprite_w
     SPRITE_H = cfg.sprite_h
     FPS = cfg.fps
@@ -73,6 +76,18 @@ def apply_config(cfg):
     PAUSE_DURATION = tuple(cfg.pause_duration)
     LOOK_DURATION = tuple(cfg.look_duration)
     DIR_CHANGE_CHANCE = cfg.dir_change_chance
+    IDLE_CHANCE = cfg.idle_chance
+    IDLE_DURATION = tuple(cfg.idle_duration)
+    SLEEP_CHANCE = cfg.sleep_chance
+    SLEEP_DURATION = tuple(cfg.sleep_duration)
+    WAVE_CHANCE = cfg.wave_chance
+    WAVE_DURATION = tuple(cfg.wave_duration)
+    BLINK_CHANCE = cfg.blink_chance
+    BLINK_DURATION = tuple(cfg.blink_duration)
+    IDLE_BUBBLE_CHANCE = cfg.idle_bubble_chance
+    FOLLOW_CURSOR = bool(cfg.follow_cursor)
+    TAP_REACT = bool(cfg.tap_react)
+    POKE_BUBBLE = str(cfg.poke_bubble)
     setup_logging(cfg.log_level)
 
 
@@ -81,6 +96,44 @@ def set_config(cfg):
     global CONFIG
     CONFIG = cfg
     apply_config(cfg)
+
+
+# ============================================================
+# 行为状态 -> 姿态组 映射 & 纯决策函数（不依赖 Tk，便于单测）
+# ============================================================
+# 不同行为状态对应的「命名姿态组」。资源里要有同名子目录才生效，
+# 缺失时 set_pose_group 自动 no-op，宠物保持当前姿态，行为逻辑不受影响。
+STATE_POSE = {
+    'crawling': 'walk',
+    'pausing': 'idle',
+    'looking': 'look',
+    'idle': 'idle',
+    'sleep': 'sleep',
+    'wave': 'wave',
+    'blink': 'blink',
+}
+
+
+def choose_crawl_action(r, pause, look, turn, idle, sleep, wave, blink):
+    """根据一次 [0,1) 随机值决定爬行中发生的动作。
+
+    返回 'pause' / 'look' / 'turn' / 'idle' / 'sleep' / 'wave' / 'blink' / None。
+    概率按入参顺序累加到阈值，第一个命中的即返回；都不命中返回 None（继续爬行）。
+    """
+    thr = 0.0
+    for action, chance in (
+        ('pause', pause), ('look', look), ('turn', turn),
+        ('idle', idle), ('sleep', sleep), ('wave', wave), ('blink', blink),
+    ):
+        thr += chance
+        if r < thr:
+            return action
+    return None
+
+
+def facing_toward(from_x, target_x):
+    """from_x 处的人物应朝左(False)还是朝右(True)以面向 target_x。"""
+    return target_x >= from_x
 
 
 # 支持的动作姿态图片格式（常量，不随配置变化）
@@ -412,10 +465,13 @@ class MatePaw:
         self.screen_h = screen_h
 
         # 加载动作姿态：
-        #   - 目录下的图片文件 = 单帧姿态（按文件名排序，第一个为默认姿态）
-        #   - 子目录 = 多帧姿态，目录内图片按文件名排序为帧序列（动画播放）
-        self.poses = []           # poses[pose][frame] -> PIL.Image(RGBA, 已缩放)
-        self.frame_index = 0      # 当前姿态内的帧序号
+        #   - 目录下的图片文件 = 单帧姿态，组名取文件名（如 foo.png -> 组 "foo"）
+        #   - 子目录 = 多帧姿态，组名取目录名，目录内图片按文件名排序为帧序列
+        # 组织成「命名姿态组」后：① 向后兼容旧资源（顶层多张图 = 多个组，右键循环）；
+        # ② 不同行为状态可映射到同名组（walk/idle/look/...），让行为有不同动画。
+        self.pose_groups = {}     # name -> [PIL.Image, ...]（已缩放 RGBA）
+        self.pose_order = []      # 保持加载顺序的组名列表
+        self.frame_index = 0      # 当前组内的帧序号
         self._frame_accum = 0     # 帧动画计时累加器
         try:
             entries = sorted(os.listdir(char_dir))
@@ -424,20 +480,22 @@ class MatePaw:
         for name in entries:
             p = os.path.join(char_dir, name)
             try:
-                if os.path.isfile(p) and os.path.splitext(name)[1].lower() in IMAGE_EXTS:
-                    self.poses.append([self._load_sprite(p)])
+                ext = os.path.splitext(name)[1].lower()
+                if os.path.isfile(p) and ext in IMAGE_EXTS:
+                    self._add_group(os.path.splitext(name)[0], [self._load_sprite(p)])
                 elif os.path.isdir(p):
                     frames = [self._load_sprite(os.path.join(p, fn))
                               for fn in sorted(os.listdir(p))
                               if os.path.splitext(fn)[1].lower() in IMAGE_EXTS]
                     if frames:
-                        self.poses.append(frames)
+                        self._add_group(name, frames)
             except Exception as e:
                 log.warning(f"[Pet {char_id}] 跳过无法加载的条目 {name}: {e}")
-        if not self.poses:
+        if not self.pose_groups:
             raise RuntimeError(f"人物目录中没有任何可用图片: {char_dir}")
         self.pose_index = 0
-        self.pose_count = len(self.poses)
+        self.pose_count = len(self.pose_order)
+        self._transient = {'group': None, 'until': 0.0}  # 被交互触发的瞬时表情
 
         margin = 120
         self.x = random.randint(margin, max(margin, screen_w - SPRITE_W - margin))
@@ -454,8 +512,9 @@ class MatePaw:
         self.state_duration = 0
         self.dragging = False
         self.visible = True
+        self.cursor_x = None       # 由主循环每帧写入的鼠标屏幕 x（看向光标用）
 
-        self.photo = ImageTk.PhotoImage(self.poses[0][0])
+        self.photo = ImageTk.PhotoImage(self._current_frame())
         self.img_id = canvas.create_image(
             self.x + SPRITE_W // 2, self.y + SPRITE_H // 2,
             image=self.photo, anchor='center', tags='pet'
@@ -487,20 +546,33 @@ class MatePaw:
 
             self.state_timer += 1
             if self.state == 'crawling':
-                r = random.random()
-                if r < PAUSE_CHANCE:
+                action = choose_crawl_action(
+                    random.random(), PAUSE_CHANCE, LOOK_CHANCE, DIR_CHANGE_CHANCE,
+                    IDLE_CHANCE, SLEEP_CHANCE, WAVE_CHANCE, BLINK_CHANCE,
+                )
+                if action == 'pause':
                     self._enter_state('pausing', PAUSE_DURATION)
-                elif r < PAUSE_CHANCE + LOOK_CHANCE:
+                elif action == 'look':
                     self._enter_state('looking', LOOK_DURATION)
-                elif r < PAUSE_CHANCE + LOOK_CHANCE + DIR_CHANGE_CHANCE:
+                elif action == 'turn':
                     self._random_turn()
+                elif action == 'idle':
+                    self._enter_state('idle', IDLE_DURATION)
+                elif action == 'sleep':
+                    self._enter_state('sleep', SLEEP_DURATION)
+                elif action == 'wave':
+                    self._enter_state('wave', WAVE_DURATION)
+                elif action == 'blink':
+                    self._enter_state('blink', BLINK_DURATION)
                 self._move()
-            elif self.state == 'pausing':
+            elif self.state in ('pausing', 'looking', 'idle', 'sleep', 'wave', 'blink'):
                 if self.state_timer >= self.state_duration:
                     self._enter_state('crawling')
-            elif self.state == 'looking':
-                if self.state_timer >= self.state_duration:
-                    self._enter_state('crawling')
+
+            # 空闲张望时看向光标（若开启且能取到光标位置）
+            if self.state == 'looking' and FOLLOW_CURSOR and self.cursor_x is not None:
+                self.facing_right = facing_toward(
+                    self.x + SPRITE_W / 2, self.cursor_x)
 
             self.bob_phase += BOB_SPEED
             self._advance_frame()
@@ -547,6 +619,9 @@ class MatePaw:
         if duration_range:
             lo, hi = duration_range
             self.state_duration = random.randint(lo, hi)
+        # 行为状态 -> 命名姿态组（资源里没有对应组则 no-op，保持当前姿态）
+        if state in STATE_POSE:
+            self.set_pose_group(STATE_POSE[state])
         if state == 'crawling':
             speed = random.uniform(CRAWL_SPEED_MIN, CRAWL_SPEED_MAX)
             angle = random.uniform(0, 2 * math.pi)
@@ -567,6 +642,49 @@ class MatePaw:
                 return True
         return False
 
+    def _add_group(self, name, frames):
+        """登记一个命名姿态组（同名只保留第一份，避免顶层文件与子目录重名冲突）。"""
+        if name not in self.pose_groups and frames:
+            self.pose_groups[name] = frames
+            self.pose_order.append(name)
+
+    def set_pose_group(self, name):
+        """切到名为 name 的姿态组（从头帧开始）；不存在则保持当前（向后兼容）。"""
+        if name and name in self.pose_groups:
+            idx = self.pose_order.index(name)
+            if idx != self.pose_index:
+                self.pose_index = idx
+                self.frame_index = 0
+
+    def current_group_name(self):
+        """当前应显示的姿态组名：瞬时反应优先，否则取当前 pose_index 对应组。"""
+        if self._transient['until'] and time.time() < self._transient['until']:
+            g = self._transient['group']
+            if g in self.pose_groups:
+                return g
+        return self.pose_order[self.pose_index]
+
+    def _current_frame(self):
+        group = self.current_group_name()
+        frames = self.pose_groups[group]
+        return frames[self.frame_index % len(frames)]
+
+    def react(self, kind):
+        """被交互触发的瞬时表情：kind 对应 REACTION 表的组名 + 持续时间(ms)。
+        资源里没有对应组时退化为保持当前姿态（仅气泡/逻辑生效，不影响行为）。"""
+        spec = self.REACTION.get(kind)
+        if not spec:
+            return
+        group, ms = spec
+        self._transient = {'group': group, 'until': time.time() + ms / 1000.0}
+
+    # 被交互触发的瞬时表情：组名 -> (姿态组, 持续毫秒)
+    REACTION = {
+        'shock': ('shock', 600),
+        'happy': ('happy', 1200),
+        'love': ('love', 1200),
+    }
+
     def next_pose(self):
         if self.pose_count > 1:
             self.pose_index = (self.pose_index + 1) % self.pose_count
@@ -585,7 +703,7 @@ class MatePaw:
 
     def _advance_frame(self):
         """推进当前姿态内的动画帧（多帧姿态才动；单帧姿态不动）。"""
-        frames = self.poses[self.pose_index]
+        frames = self.pose_groups[self.current_group_name()]
         if len(frames) <= 1:
             return
         anim_step = max(2, FPS // 8)  # 约 8fps 的动画速度
@@ -595,7 +713,7 @@ class MatePaw:
             self.frame_index = (self.frame_index + 1) % len(frames)
 
     def _render(self):
-        base = self.poses[self.pose_index][self.frame_index]
+        base = self._current_frame()
         if self.facing_right:
             display = base.copy()
         else:
