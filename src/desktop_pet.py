@@ -1,5 +1,7 @@
 """
-桌面宠物应用 - mate-paw (v5)
+桌面宠物应用 - mate-paw (v5.1)
+多只"人形猴子"在桌面自由爬行玩耍，感知窗口边缘作为障碍物。
+配置来自 config.json（带默认值，见 src/config.py）。
 4 个"人形猴子"在桌面自由爬行玩耍，感知窗口边缘作为障碍物。
 交互：
   - 鼠标左键拖动人物到其他位置
@@ -23,33 +25,68 @@ import queue
 import threading
 import ctypes
 from ctypes import wintypes
+import logging
+
 import pystray
 
+from config import load_config, APP_VERSION
+
 # ============================================================
-# 配置
+# 配置（来自 config.json，带默认值回退，见 src/config.py）
 # ============================================================
-SPRITE_W = 180
-SPRITE_H = 260
-FPS = 30
+CONFIG, CONFIG_SOURCE = load_config()
+
+SPRITE_W = CONFIG.sprite_w
+SPRITE_H = CONFIG.sprite_h
+FPS = CONFIG.fps
 UPDATE_MS = 1000 // FPS
-BOB_AMP = 6
-BOB_SPEED = 0.18
-SCALE_RANGE = 0.025
+BOB_AMP = CONFIG.bob_amp
+BOB_SPEED = CONFIG.bob_speed
+SCALE_RANGE = CONFIG.scale_range
 
 # 气泡对话（如"叫爸爸"）
-BUBBLE_FONT_SIZE = 34
-BUBBLE_DURATION_MS = 2500
+BUBBLE_FONT_SIZE = CONFIG.bubble_font_size
+BUBBLE_DURATION_MS = CONFIG.bubble_duration_ms
 
 # 支持的动作姿态图片格式
 IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.tif', '.tiff')
 
-CRAWL_SPEED_MIN = 1.5
-CRAWL_SPEED_MAX = 3.5
-PAUSE_CHANCE = 0.006
-LOOK_CHANCE = 0.004
-PAUSE_DURATION = (40, 120)
-LOOK_DURATION = (50, 150)
-DIR_CHANGE_CHANCE = 0.012
+CRAWL_SPEED_MIN = CONFIG.crawl_speed_min
+CRAWL_SPEED_MAX = CONFIG.crawl_speed_max
+PAUSE_CHANCE = CONFIG.pause_chance
+LOOK_CHANCE = CONFIG.look_chance
+PAUSE_DURATION = tuple(CONFIG.pause_duration)
+LOOK_DURATION = tuple(CONFIG.look_duration)
+DIR_CHANGE_CHANCE = CONFIG.dir_change_chance
+
+# ============================================================
+# 日志（替代散落的 print；打包后额外写文件到 %APPDATA%/mate_paw）
+# ============================================================
+log = logging.getLogger("mate_paw")
+
+
+def setup_logging(level_name: str = "INFO") -> None:
+    level = getattr(logging, str(level_name).upper(), logging.INFO)
+    log.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    log.addHandler(sh)
+    if getattr(sys, "frozen", False):
+        try:
+            appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+            d = os.path.join(appdata, "mate_paw")
+            os.makedirs(d, exist_ok=True)
+            fh = logging.FileHandler(os.path.join(d, "mate_paw.log"), encoding="utf-8")
+            fh.setFormatter(fmt)
+            log.addHandler(fh)
+        except Exception:
+            pass
+    log.setLevel(level)
+
+
+# 导入即配置一次，保证任何位置的 log 调用都有去处
+setup_logging(CONFIG.log_level)
 
 # ============================================================
 # 全局鼠标钩子 (ctypes)
@@ -266,9 +303,9 @@ class PystrayTrayIcon:
             )
             # run_detached：在守护线程中运行消息循环，立即返回，不阻塞 tkinter 主线程
             self.icon.run_detached()
-            print("[Tray] pystray tray icon started")
+            log.info("[Tray] pystray tray icon started")
         except Exception as e:
-            print(f"[Tray] ERROR starting pystray tray: {e}")
+            log.error(f"[Tray] ERROR starting pystray tray: {e}")
 
     def stop(self):
         """停止托盘图标并从通知区域移除。"""
@@ -278,7 +315,7 @@ class PystrayTrayIcon:
             except Exception:
                 pass
             self.icon = None
-        print("[Tray] Tray stopped")
+        log.info("[Tray] Tray stopped")
 
 
 # ============================================================
@@ -344,7 +381,7 @@ class MatePaw:
                     img = img.resize((SPRITE_W, SPRITE_H), Image.LANCZOS)
                     self.pose_images.append(img)
                 except Exception as e:
-                    print(f"[Pet {char_id}] 跳过无法加载的图片 {fn}: {e}")
+                    log.warning(f"[Pet {char_id}] 跳过无法加载的图片 {fn}: {e}")
         if not self.pose_images:
             raise RuntimeError(f"人物目录中没有任何可用图片: {char_dir}")
         self.pose_index = 0
@@ -411,7 +448,7 @@ class MatePaw:
             self.bob_phase += BOB_SPEED
             self._render()
         except Exception as e:
-            print(f"[Pet {self.label}] update error: {e}")
+            log.error(f"[Pet {self.label}] update error: {e}")
 
     def _move(self):
         speed = math.sqrt(self.vx ** 2 + self.vy ** 2) or 1.0
@@ -512,7 +549,7 @@ class MatePaw:
             self.bubble_until = time.time() + duration_ms / 1000.0
             self.canvas.itemconfig(self.bubble_id, image=self.bubble_photo)
         except Exception as e:
-            print(f"[Pet {self.label}] say error: {e}")
+            log.error(f"[Pet {self.label}] say error: {e}")
 
     def _build_bubble(self, text):
         """用 PIL 现画一个白色圆角气泡 + 朝下小尾巴 + 居中文字，返回 (img, w, h)。"""
@@ -616,7 +653,7 @@ class MatePawApp:
                 ex |= win32con.WS_EX_LAYERED | win32con.WS_EX_TOOLWINDOW
                 win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex)
             except Exception as e:
-                print(f"Warning: style: {e}")
+                log.warning(f"Warning: style: {e}")
         # 初始 region：根据可见宠物集合随时更新
         self._update_window_region()
 
@@ -728,9 +765,9 @@ class MatePawApp:
         res_dir = get_res_dir()
 
         if not os.path.isdir(res_dir):
-            print(f"[Pet] 未找到 res 资源目录: {res_dir}")
-            print("[Pet] 请在程序运行文件夹下创建 res 目录，并在其中为每个"
-                  "人物建立一个子文件夹（文件夹名即人物 id），子文件夹内存放该人物的所有动作姿态图片。")
+            log.warning(f"[Pet] 未找到 res 资源目录: {res_dir}")
+            log.warning("[Pet] 请在程序运行文件夹下创建 res 目录，并在其中为每个"
+                        "人物建立一个子文件夹（文件夹名即人物 id），子文件夹内存放该人物的所有动作姿态图片。")
             return
 
         # res 下每个子文件夹即一个人物，文件夹名即人物 id
@@ -739,7 +776,7 @@ class MatePawApp:
             if os.path.isdir(os.path.join(res_dir, d))
         )
         if not char_ids:
-            print(f"[Pet] res 目录下没有找到任何人物文件夹: {res_dir}")
+            log.warning(f"[Pet] res 目录下没有找到任何人物文件夹: {res_dir}")
             return
 
         for cid in char_ids:
@@ -747,9 +784,9 @@ class MatePawApp:
             try:
                 pet = MatePaw(self.canvas, char_dir, cid, cid, self.screen_w, self.screen_h)
                 self.pets.append(pet)
-                print(f"[Pet] 已加载人物 {cid}（共 {pet.pose_count} 个姿态）")
+                log.info(f"[Pet] 已加载人物 {cid}（共 {pet.pose_count} 个姿态）")
             except Exception as e:
-                print(f"[Pet] 跳过人物 {cid}: {e}")
+                log.warning(f"[Pet] 跳过人物 {cid}: {e}")
 
     # ---- 系统托盘图标（pystray）----
     def _setup_tray_icon(self):
@@ -762,7 +799,7 @@ class MatePawApp:
             )
             self.tray.start()
         except Exception as e:
-            print(f"[Tray] ERROR starting pystray tray: {e}")
+            log.error(f"[Tray] ERROR starting pystray tray: {e}")
 
     def _on_tray_toggle(self, idx):
         """托盘菜单切换人物显隐——从托盘线程调用，调度到主线程执行。"""
@@ -862,9 +899,39 @@ class MatePawApp:
             pass
 
     def run(self):
-        print(f"[mate_paw] {len(self.pets)} pets on {self.screen_w}x{self.screen_h}")
-        print("左键拖动 / 右键换姿态 / 双击喊爸爸 / 托盘图标开关人物 / Esc 退出")
+        log.info(f"[mate_paw] {len(self.pets)} pets on {self.screen_w}x{self.screen_h}")
+        log.info("左键拖动 / 右键换姿态 / 双击喊爸爸 / 托盘图标开关人物 / Esc 退出")
         self.root.mainloop()
+
+
+def self_check() -> int:
+    """启动自检（无界面）：校验资源目录 / 字体 / 关键依赖。返回进程退出码。"""
+    ok = True
+    log.info(f"mate-paw v{APP_VERSION} 自检")
+    res = get_res_dir()
+    if os.path.isdir(res):
+        chars = [d for d in os.listdir(res)
+                 if os.path.isdir(os.path.join(res, d))]
+        log.info(f"[OK] res 目录: {res}（{len(chars)} 个人物）")
+        if not chars:
+            log.warning("[WARN] res 目录下没有任何人物文件夹")
+    else:
+        log.error(f"[FAIL] 未找到 res 目录: {res}")
+        ok = False
+    try:
+        load_cjk_font(20)
+        log.info("[OK] 中文字体可用")
+    except Exception as e:
+        log.warning(f"[WARN] 中文字体加载失败: {e}")
+    for m in ("PIL", "win32gui", "pystray", "tkinter"):
+        try:
+            __import__(m)
+            log.info(f"[OK] 依赖 {m}")
+        except Exception as e:
+            log.error(f"[FAIL] 依赖缺失 {m}: {e}")
+            ok = False
+    log.info("自检结果: %s", "通过" if ok else "存在问题")
+    return 0 if ok else 1
 
 
 if __name__ == '__main__':
@@ -877,4 +944,10 @@ if __name__ == '__main__':
             sys.stderr = open(os.devnull, 'w')
     except Exception:
         pass
+    args = sys.argv[1:]
+    if "--version" in args:
+        print(APP_VERSION)
+        sys.exit(0)
+    if "--check" in args:
+        sys.exit(self_check())
     MatePawApp().run()
