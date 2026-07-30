@@ -29,7 +29,11 @@ from PIL import Image
 HERE = os.path.dirname(os.path.abspath(__file__))
 STAGE1 = os.path.join(HERE, "stage1")             # 单人裁剪图 + manifest
 STAGE2 = os.path.join(HERE, "stage2")             # ImageGen 生成原图（待抠图）
-RES = os.path.join(HERE, "..", "mate-paw", "res") # 最终落盘（桌面宠物资源目录）
+RES = os.path.join(HERE, "..", "res")            # 最终落盘（桌面宠物资源目录，与运行时一致）
+
+# 复用桌面宠物的资源校验（共享逻辑，避免重复实现）
+sys.path.insert(0, os.path.join(HERE, "..", "src"))
+from res_validator import validate_res  # noqa: E402
 
 POSES = [("", "crawl"), ("_sit", "sit"), ("_wave", "wave")]
 
@@ -187,11 +191,17 @@ def cmd_detect(args):
 def compose_one(src_path, dst_path, target=(768, 1024), pad=0.06):
     from rembg import remove
     im = Image.open(src_path).convert("RGBA")
-    im = remove(im)                         # AI 抠图（白色外套也安全）
+    try:
+        im = remove(im)                         # AI 抠图（白色外套也安全）
+    except Exception as e:
+        print(f"  [warn] rembg 抠图失败（{e}），保留原图透明通道继续")
     # 去掉完全透明的外边界
     bbox = im.getbbox()
     if bbox:
         im = im.crop(bbox)
+    if not im.getbbox():
+        print(f"  [skip] 完全透明，跳过: {src_path}")
+        return
     iw, ih = im.size
     tw, th = target
     scale = min((tw * (1 - pad)) / iw, (th * (1 - pad)) / ih)
@@ -222,6 +232,30 @@ def cmd_compose(args):
     print("\ncompose 完成，已落盘到 mate-paw/res/")
 
 
+def cmd_validate(args):
+    """校验 res 资源目录：图片可读性 / 透明度 / 姿态完整性。"""
+    res = args.res or RES
+    report = validate_res(res)
+    if report["missing"]:
+        print(f"[FAIL] 未找到 res 目录: {res}")
+        raise SystemExit(1)
+    if report["empty"]:
+        print(f"[WARN] res 目录下没有任何人物文件夹: {res}")
+        raise SystemExit(0)
+    print(f"res 目录: {res}（{len(report['chars'])} 个人物）")
+    any_fail = False
+    for name, info in report["chars"].items():
+        if info["ok"]:
+            print(f"  [OK]   {name}")
+        else:
+            any_fail = True
+            print(f"  [FAIL] {name}:")
+            for iss in info["issues"]:
+                print(f"         - {iss}")
+    print("校验结果:", "通过" if not any_fail else "存在问题")
+    raise SystemExit(1 if any_fail else 0)
+
+
 def main():
     ap = argparse.ArgumentParser(description="桌面宠物姿势生成一键流水线")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -236,8 +270,12 @@ def main():
 
     c = sub.add_parser("compose", help="批量抠图 + 合成 + 落盘")
     c.add_argument("--stage2", default=None, help="生成原图目录（默认 ./stage2）")
-    c.add_argument("--res", default=None, help="最终落盘目录（默认 ../mate-paw/res）")
+    c.add_argument("--res", default=None, help="最终落盘目录（默认 ../res）")
     c.set_defaults(func=cmd_compose)
+
+    v = sub.add_parser("validate", help="校验 res 资源目录（可读性/透明度/姿态完整性）")
+    v.add_argument("--res", default=None, help="资源目录（默认 ../res）")
+    v.set_defaults(func=cmd_validate)
 
     args = ap.parse_args()
     args.func(args)

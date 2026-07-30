@@ -31,6 +31,7 @@ import logging
 import pystray
 
 from config import load_config, APP_VERSION, default_config_path, Config
+from res_validator import validate_res
 
 # ============================================================
 # 配置（来自 config.json，带默认值回退，见 src/config.py）
@@ -1183,15 +1184,22 @@ def self_check() -> int:
     ok = True
     log.info(f"mate-paw v{APP_VERSION} 自检")
     res = get_res_dir()
-    if os.path.isdir(res):
-        chars = [d for d in os.listdir(res)
-                 if os.path.isdir(os.path.join(res, d))]
-        log.info(f"[OK] res 目录: {res}（{len(chars)} 个人物）")
-        if not chars:
-            log.warning("[WARN] res 目录下没有任何人物文件夹")
-    else:
+    report = validate_res(res)
+    if report['missing']:
         log.error(f"[FAIL] 未找到 res 目录: {res}")
         ok = False
+    elif report['empty']:
+        log.warning(f"[WARN] res 目录下没有任何人物文件夹: {res}")
+    else:
+        log.info(f"[OK] res 目录: {res}（{len(report['chars'])} 个人物）")
+        for name, info in report['chars'].items():
+            if info['ok']:
+                log.info(f"[OK] 人物 {name}")
+            else:
+                ok = False
+                log.error(f"[FAIL] 人物 {name}:")
+                for iss in info['issues']:
+                    log.error(f"      - {iss}")
     try:
         load_cjk_font(20)
         log.info("[OK] 中文字体可用")
