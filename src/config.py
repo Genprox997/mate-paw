@@ -26,6 +26,8 @@ DEFAULTS = {
     "bob_amp": 6,
     "bob_speed": 0.18,
     "scale_range": 0.025,
+    # 渲染缓存（A. 性能）：PhotoImage LRU 上限；调小省内存、调大减少重建
+    "photo_cache_max": 384,
     # 气泡对话
     "bubble_font_size": 34,
     "bubble_duration_ms": 2500,

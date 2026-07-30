@@ -23,6 +23,7 @@ import queue
 import threading
 import ctypes
 import logging
+from collections import OrderedDict
 from platform_win import (
     HAS_WIN32,
     get_screen_size,
@@ -55,6 +56,7 @@ CONFIG, CONFIG_SOURCE = load_config()
 def apply_config(cfg):
     """把配置值同步到模块级常量；设置面板改完调用它即可实时生效。"""
     global SPRITE_W, SPRITE_H, FPS, UPDATE_MS, BOB_AMP, BOB_SPEED, SCALE_RANGE, \
+        PHOTO_CACHE_MAX, \
         BUBBLE_FONT_SIZE, BUBBLE_DURATION_MS, CRAWL_SPEED_MIN, CRAWL_SPEED_MAX, \
         PAUSE_CHANCE, LOOK_CHANCE, PAUSE_DURATION, LOOK_DURATION, DIR_CHANGE_CHANCE, \
         IDLE_CHANCE, IDLE_DURATION, SLEEP_CHANCE, SLEEP_DURATION, WAVE_CHANCE, \
@@ -67,6 +69,7 @@ def apply_config(cfg):
     BOB_AMP = cfg.bob_amp
     BOB_SPEED = cfg.bob_speed
     SCALE_RANGE = cfg.scale_range
+    PHOTO_CACHE_MAX = int(cfg.photo_cache_max)
     BUBBLE_FONT_SIZE = cfg.bubble_font_size
     BUBBLE_DURATION_MS = cfg.bubble_duration_ms
     CRAWL_SPEED_MIN = cfg.crawl_speed_min
@@ -281,6 +284,25 @@ def rects_overlap(r1, r2):
     return not (r1[2] <= r2[0] or r1[0] >= r2[2] or r1[3] <= r2[1] or r1[1] >= r2[3])
 
 
+def compute_pet_rects(pets, screen_w, screen_h):
+    """收集所有可见宠物在屏幕坐标下的矩形并集（窗口局部点击区域用）。
+
+    纯函数（不依赖 Tk / win32），便于单测「布局未变 -> 签名不变 -> 跳过 SetWindowRgn」。
+    """
+    rects = []
+    for pet in pets:
+        if not pet.visible:
+            continue
+        x1 = max(0, int(pet.x))
+        y1 = max(0, int(pet.y))
+        x2 = min(screen_w, int(pet.x) + SPRITE_W)
+        y2 = min(screen_h, int(pet.y) + SPRITE_H)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        rects.append((x1, y1, x2, y2))
+    return rects
+
+
 def make_tray_icon_image(size=64):
     """生成系统托盘图标：棕色圆脸 + 耳朵（猴子风格）。"""
     img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
@@ -489,6 +511,51 @@ def load_cjk_font(size):
     _FONT_CACHE[size] = font
     return font
 
+# ============================================================
+# 渲染缓存（A. 性能与渲染）
+# ============================================================
+class SpriteCache:
+    """按 (group, frame, facing) 惰性缓存「翻转后的 PIL」与「ImageTk.PhotoImage」。
+
+    旧实现每帧都对精灵做 FLIP_LEFT_RIGHT + LANCZOS 缩放 + 新建 PhotoImage，
+    30fps × 多只宠物下 CPU 开销显著。这里把「朝向翻转」与「Tcl 图片对象」都缓存起来：
+      - 翻转 PIL 只算一次（_flip）；
+      - 最终显示的 PhotoImage 按 LRU 上限缓存（_photos），命中即返回同一对象，
+        避免每帧重建 Tcl 图片。
+    PhotoImage 一旦被 self.photo 引用就不会被 Tk 释放，所以 LRU 淘汰只会丢弃
+    「当前没在显示」的条目，不会造成画面闪烁/空白。
+    """
+
+    def __init__(self, pose_groups, photo_cache_max=384):
+        self.pose_groups = pose_groups          # name -> [PIL.Image, ...]
+        self.max = max(1, int(photo_cache_max))
+        self._flip = {}                         # (group, frame) -> 翻转后的 PIL
+        self._photos = OrderedDict()            # (group, frame, facing) -> PhotoImage
+
+    def get(self, group, frame, facing):
+        """返回 (group, frame, facing) 对应的 PhotoImage；命中缓存则直接复用。"""
+        key = (group, frame, facing)
+        ph = self._photos.get(key)
+        if ph is not None:
+            self._photos.move_to_end(key)
+            return ph
+        base = self.pose_groups[group][frame]
+        if not facing:
+            fk = (group, frame)
+            f = self._flip.get(fk)
+            if f is None:
+                f = base.transpose(Image.FLIP_LEFT_RIGHT)
+                self._flip[fk] = f
+            base = f
+        ph = ImageTk.PhotoImage(base)
+        self._photos[key] = ph
+        self._photos.move_to_end(key)
+        # LRU 淘汰：超出上限时丢弃最久未用的（当前显示的条目由 self.photo 保活）
+        while len(self._photos) > self.max:
+            self._photos.popitem(last=False)
+        return ph
+
+
 class MatePaw:
     def __init__(self, canvas, char_dir, char_id, label, screen_w, screen_h):
         self.canvas = canvas
@@ -529,6 +596,9 @@ class MatePaw:
         self.pose_index = 0
         self.pose_count = len(self.pose_order)
         self._transient = {'group': None, 'until': 0.0}  # 被交互触发的瞬时表情
+        # 渲染缓存：按 (group,frame,facing) 复用 PhotoImage，免去每帧重建
+        self._cache = SpriteCache(self.pose_groups, PHOTO_CACHE_MAX)
+        self._last_render_key = None   # 上一次实际切换的渲染键，用于跳过无变化的重建
 
         margin = 120
         self.x = random.randint(margin, max(margin, screen_w - SPRITE_W - margin))
@@ -751,24 +821,26 @@ class MatePaw:
             self.frame_index = (self.frame_index + 1) % len(frames)
 
     def _render(self):
-        base = self._current_frame()
-        if self.facing_right:
-            display = base.copy()
-        else:
-            display = base.transpose(Image.FLIP_LEFT_RIGHT)
+        """把当前帧绘制到画布。
 
-        scale = 1.0 + SCALE_RANGE * math.sin(self.bob_phase * 0.5)
-        new_w = max(1, int(display.width * scale))
-        new_h = max(1, int(display.height * scale))
-        display = display.resize((new_w, new_h), Image.LANCZOS)
+        性能关键路径（A）：仅在「渲染键」(group,frame,facing) 变化时才通过缓存
+        重建 PhotoImage；宠物移动只更新坐标（便宜），朝向/帧动画/姿态切换才触发
+        重建。旧实现每帧都做翻转 + LANCZOS 缩放 + 新建 PhotoImage，这里全部消除。
+        """
+        group = self.current_group_name()
+        frames = self.pose_groups[group]
+        frame = self.frame_index % len(frames)
+        key = (group, frame, self.facing_right)
+        if key != self._last_render_key:
+            self.photo = self._cache.get(group, frame, self.facing_right)
+            self.canvas.itemconfig(self.img_id, image=self.photo)
+            self._last_render_key = key
 
+        # 上下 bob 浮动（保留轻微「呼吸」动感，但不缩放图片，零额外像素运算）
         bob_y = int(math.sin(self.bob_phase) * BOB_AMP)
-
-        self.photo = ImageTk.PhotoImage(display)
-        cx = self.x + SPRITE_W // 2 + (new_w - SPRITE_W) // 2
-        cy = self.y + SPRITE_H // 2 + bob_y + (new_h - SPRITE_H) // 2
+        cx = self.x + SPRITE_W // 2
+        cy = self.y + SPRITE_H // 2 + bob_y
         self.canvas.coords(self.img_id, cx, cy)
-        self.canvas.itemconfig(self.img_id, image=self.photo)
         self._update_bubble()
 
     def say(self, text, duration_ms=BUBBLE_DURATION_MS):
@@ -844,6 +916,7 @@ class MatePawApp:
         self._hook = None
         self.tray = None
         self.hwnd = None  # 主窗口句柄，用于 SetWindowRgn
+        self._region_sig = None  # 窗口可点区域签名缓存（未变则跳过 SetWindowRgn）
         self.paused = False  # 全局暂停：宠物停止爬行但保持显示/呼吸
         self.state_path = state_path()  # 状态持久化文件路径
         # 鼠标钩子内用于跟踪是否吞掉右键事件（仅由钩子线程读写，避免竞态）
@@ -892,21 +965,18 @@ class MatePawApp:
         与钩子吞事件不同，它会让 Windows 正确收到鼠标释放消息，避免卡死。
         SetWindowRgn 接管传入 region 的所有权，下次调用或销毁窗口时会自动释放。
         拖动期间由 _set_window_region_fullscreen 接管，本方法不会再被调用。
+
+        性能（A）：多数帧宠物并未移动/显隐变化，此时矩形并集签名不变，直接跳过
+        set_window_region（一次 win32 系统调用），避免每帧空转 syscall。
         """
         if not self.hwnd or self.drag:
             return
         try:
-            rects = []
-            for pet in self.pets:
-                if not pet.visible:
-                    continue
-                x1 = max(0, pet.x)
-                y1 = max(0, pet.y)
-                x2 = min(self.screen_w, pet.x + SPRITE_W)
-                y2 = min(self.screen_h, pet.y + SPRITE_H)
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                rects.append((x1, y1, x2, y2))
+            rects = compute_pet_rects(self.pets, self.screen_w, self.screen_h)
+            sig = tuple(rects)
+            if sig == self._region_sig:
+                return
+            self._region_sig = sig
             set_window_region(self.hwnd, rects)
         except Exception:
             # 失败回退到全屏 region（不损失功能，但点击可能落到桌面图标）
@@ -1194,10 +1264,14 @@ class MatePawApp:
                 self._handle_mouse(et, x, y)
         except Exception:
             pass
-        # 把光标屏幕 x 写入每只宠物（看向光标用）；无指针/不可取时置 None
-        try:
-            cx = self.root.winfo_pointerx()
-        except Exception:
+        # 把光标屏幕 x 写入每只宠物（看向光标用）；无指针/不可取时置 None。
+        # 仅在开启 FOLLOW_CURSOR 时才查询指针（一次 Tcl 调用），否则置 None 省开销。
+        if FOLLOW_CURSOR:
+            try:
+                cx = self.root.winfo_pointerx()
+            except Exception:
+                cx = None
+        else:
             cx = None
         for pet in self.pets:
             pet.cursor_x = cx if (cx is not None and cx >= 0) else None
