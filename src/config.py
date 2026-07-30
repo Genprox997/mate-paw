@@ -55,7 +55,8 @@ DEFAULTS = {
     "tap_react": True,
     "poke_bubble": "喂！",
     "sound": False,
-    "bubble_lines": ["爸！", "你好呀~", "陪我玩", "吱吱", "摸摸我", "好痒", "嘻嘻"],
+    "bubble_lines": ["爸！", "你好呀~", "陪我玩", "吱吱", "摸摸我", "好痒", "嘻嘻",
+                     "别戳啦", "再戳就咬你", "汪？", "饿饿", "今天也要加油", "在发呆…"],
     # 抠图色键容差（四角采样色键方案，见 desktop_pet.chroma_key）
     "chroma_tolerance": 40,
 }

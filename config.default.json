@@ -11,13 +11,56 @@
   "crawl_speed_max": 3.5,
   "pause_chance": 0.006,
   "look_chance": 0.004,
-  "pause_duration": [40, 120],
-  "look_duration": [50, 150],
+  "pause_duration": [
+    40,
+    120
+  ],
+  "look_duration": [
+    50,
+    150
+  ],
   "dir_change_chance": 0.012,
+  "idle_chance": 0.0008,
+  "idle_duration": [
+    60,
+    160
+  ],
+  "sleep_chance": 0.0004,
+  "sleep_duration": [
+    600,
+    1800
+  ],
+  "wave_chance": 0.0004,
+  "wave_duration": [
+    40,
+    90
+  ],
+  "blink_chance": 0.0015,
+  "blink_duration": [
+    6,
+    14
+  ],
   "log_level": "INFO",
   "pause_all_on_start": false,
   "follow_cursor": false,
+  "idle_bubble_chance": 0.0006,
+  "tap_react": true,
+  "poke_bubble": "喂！",
   "sound": false,
-  "bubble_lines": ["爸！", "你好呀~", "陪我玩", "吱吱", "摸摸我"],
+  "bubble_lines": [
+    "爸！",
+    "你好呀~",
+    "陪我玩",
+    "吱吱",
+    "摸摸我",
+    "好痒",
+    "嘻嘻",
+    "别戳啦",
+    "再戳就咬你",
+    "汪？",
+    "饿饿",
+    "今天也要加油",
+    "在发呆…"
+  ],
   "chroma_tolerance": 40
 }
