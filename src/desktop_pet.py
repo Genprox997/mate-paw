@@ -248,7 +248,8 @@ def chroma_key(im, tolerance=None):
       - 从图像边缘开始泛洪，只移除「与边缘连通」的背景像素；
       - 人物内部浅色区域（白裤子、皮肤高光等）因不连通到边缘而保留，
         不会出现身体空洞。
-      - 透明 PNG（如 rembg 产出）边缘全透明时直接跳过。
+      - 已透明 PNG（如 rembg 产出，边缘大部分透明时）直接跳过，
+        避免误把人物衣物当背景删除。
     tolerance 为 RGB 欧氏距离阈值，默认取 CONFIG.chroma_tolerance。
     """
     if im.mode != 'RGBA':
@@ -260,11 +261,13 @@ def chroma_key(im, tolerance=None):
     # 边缘采样点：四角 + 四边中点
     pts = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1),
            (w // 2, 0), (0, h // 2), (w - 1, h // 2), (w // 2, h - 1)]
-    rs = [px[x, y][0] for (x, y) in pts if px[x, y][3] > 10]
-    gs = [px[x, y][1] for (x, y) in pts if px[x, y][3] > 10]
-    bs = [px[x, y][2] for (x, y) in pts if px[x, y][3] > 10]
-    if not rs:
-        return im  # 边缘全透明：已是透明图，无需处理
+    opaque_samples = [(x, y) for (x, y) in pts if px[x, y][3] > 10]
+    # 大部分边缘已透明 → rembg 预处理过的图，直接跳过（避免把人物深色衣物当背景删）
+    if len(opaque_samples) <= len(pts) // 4:  # ≤2/8 采样点不透明
+        return im
+    rs = [px[x, y][0] for (x, y) in opaque_samples]
+    gs = [px[x, y][1] for (x, y) in opaque_samples]
+    bs = [px[x, y][2] for (x, y) in opaque_samples]
     br = sorted(rs)[len(rs) // 2]
     bg = sorted(gs)[len(gs) // 2]
     bb = sorted(bs)[len(bs) // 2]

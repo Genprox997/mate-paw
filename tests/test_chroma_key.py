@@ -69,3 +69,28 @@ def test_floodfill_preserves_internal_light_regions():
     # 关键：白色内部（白裤子）必须保留！这是修复的核心
     assert out.getpixel((mid_x, cy + rh // 2))[3] == 255
     assert out.getpixel((mid_x, cy + rh // 2))[:3] == (250, 250, 250)
+
+
+def test_skips_rembg_image_with_minor_edge_leakage():
+    """rembg 预处理的透明图：即使边缘有 1-2 个像素不透明（脚/手触边），
+    也应跳过色键，避免把深色衣物当背景删掉。
+
+    回归测试：xjy_wave.png 底边中点有 1 个近不透明像素(alpha=254)，
+    旧版(全透明才跳过)会以深色为背景色做泛洪，误删 12 万像素。
+    """
+    # 模拟：大部分边缘透明的图，仅底边中点有 1 个不透明像素
+    im = Image.new("RGBA", (100, 100), (0, 0, 0, 0))  # 全透明底
+    # 放一个「人物」在中间（不透明）
+    for x in range(30, 70):
+        for y in range(20, 80):
+            im.putpixel((x, y), (40, 30, 20, 255))  # 深色衣物
+    # 底边中点有 1 个不透明像素（模拟脚触边）
+    im.putpixel((50, 99), (30, 20, 10, 250))
+
+    out = chroma_key(im, tolerance=40)
+    # 应该被跳过：所有像素保持不变
+    for x in range(30, 70):
+        for y in range(20, 80):
+            assert out.getpixel((x, y))[3] == 255, f"pixel ({x},{y}) should stay opaque"
+    # 底边那个泄漏像素也不应触发处理
+    assert out.getpixel((50, 99))[3] == 250
