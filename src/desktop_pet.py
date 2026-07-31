@@ -61,7 +61,7 @@ def apply_config(cfg):
         PAUSE_CHANCE, LOOK_CHANCE, PAUSE_DURATION, LOOK_DURATION, DIR_CHANGE_CHANCE, \
         IDLE_CHANCE, IDLE_DURATION, SLEEP_CHANCE, SLEEP_DURATION, WAVE_CHANCE, \
         WAVE_DURATION, BLINK_CHANCE, BLINK_DURATION, IDLE_BUBBLE_CHANCE, \
-        FOLLOW_CURSOR, TAP_REACT, POKE_BUBBLE
+        FOLLOW_CURSOR, TAP_REACT, POKE_BUBBLE, ACTION_GAP, ACTION_REPEAT_BLOCK
     SPRITE_W = cfg.sprite_w
     SPRITE_H = cfg.sprite_h
     FPS = cfg.fps
@@ -91,6 +91,8 @@ def apply_config(cfg):
     FOLLOW_CURSOR = bool(cfg.follow_cursor)
     TAP_REACT = bool(cfg.tap_react)
     POKE_BUBBLE = str(cfg.poke_bubble)
+    ACTION_GAP = int(cfg.action_gap)
+    ACTION_REPEAT_BLOCK = int(cfg.action_repeat_block)
     setup_logging(cfg.log_level)
 
 
@@ -117,17 +119,23 @@ STATE_POSE = {
 }
 
 
-def choose_crawl_action(r, pause, look, turn, idle, sleep, wave, blink):
+def choose_crawl_action(r, pause, look, turn, idle, sleep, wave, blink, exclude=None):
     """根据一次 [0,1) 随机值决定爬行中发生的动作。
 
     返回 'pause' / 'look' / 'turn' / 'idle' / 'sleep' / 'wave' / 'blink' / None。
     概率按入参顺序累加到阈值，第一个命中的即返回；都不命中返回 None（继续爬行）。
+
+    exclude: 若某动作刚触发过、处于冷却窗口，应传入该动作名以跳过它，
+        避免同一动作（如左右张望）被连续触发。被排除动作的概率会被其余动作
+        按比例吸收，整体触发节奏不变。
     """
     thr = 0.0
     for action, chance in (
         ('pause', pause), ('look', look), ('turn', turn),
         ('idle', idle), ('sleep', sleep), ('wave', wave), ('blink', blink),
     ):
+        if action == exclude:
+            continue
         thr += chance
         if r < thr:
             return action
@@ -613,6 +621,10 @@ class MatePaw:
         self.state = 'crawling'
         self.state_timer = 0
         self.state_duration = 0
+        # 防连发冷却状态：刚结束的动作先安静爬行一段时间，且同一动作在窗口内禁止重复
+        self._last_action = None        # 上一个触发的瞬时动作（turn 不入）
+        self._repeat_block = 0          # 该动作禁止重复的剩余帧数
+        self._action_gap = 0            # 强制安静爬行（不触发任何动作）的剩余帧数
         self.dragging = False
         self.visible = True
         self.cursor_x = None       # 由主循环每帧写入的鼠标屏幕 x（看向光标用）
@@ -649,24 +661,43 @@ class MatePaw:
 
             self.state_timer += 1
             if self.state == 'crawling':
-                action = choose_crawl_action(
-                    random.random(), PAUSE_CHANCE, LOOK_CHANCE, DIR_CHANGE_CHANCE,
-                    IDLE_CHANCE, SLEEP_CHANCE, WAVE_CHANCE, BLINK_CHANCE,
-                )
+                # 防连发冷却：
+                #  - _repeat_block：上一动作禁止重复的剩余帧数，每帧递减；
+                #  - _action_gap：刚结束动作后强制安静爬行、不触发任何动作的剩余帧数。
+                # 冷却期内不掷骰，避免"左右张望"之类被连续触发导致刷新过快。
+                if self._repeat_block > 0:
+                    self._repeat_block -= 1
+                if self._action_gap > 0:
+                    self._action_gap -= 1
+                    action = None
+                else:
+                    exclude = self._last_action if self._repeat_block > 0 else None
+                    action = choose_crawl_action(
+                        random.random(), PAUSE_CHANCE, LOOK_CHANCE, DIR_CHANGE_CHANCE,
+                        IDLE_CHANCE, SLEEP_CHANCE, WAVE_CHANCE, BLINK_CHANCE,
+                        exclude=exclude,
+                    )
                 if action == 'pause':
                     self._enter_state('pausing', PAUSE_DURATION)
+                    self._register_action('pause')
                 elif action == 'look':
                     self._enter_state('looking', LOOK_DURATION)
+                    self._register_action('look')
                 elif action == 'turn':
                     self._random_turn()
+                    self._register_action('turn', transient=False)
                 elif action == 'idle':
                     self._enter_state('idle', IDLE_DURATION)
+                    self._register_action('idle')
                 elif action == 'sleep':
                     self._enter_state('sleep', SLEEP_DURATION)
+                    self._register_action('sleep')
                 elif action == 'wave':
                     self._enter_state('wave', WAVE_DURATION)
+                    self._register_action('wave')
                 elif action == 'blink':
                     self._enter_state('blink', BLINK_DURATION)
+                    self._register_action('blink')
                 self._move()
             elif self.state in ('pausing', 'looking', 'idle', 'sleep', 'wave', 'blink'):
                 if self.state_timer >= self.state_duration:
@@ -742,6 +773,19 @@ class MatePaw:
         speed = max(CRAWL_SPEED_MIN, min(CRAWL_SPEED_MAX, speed))
         self.vx = speed * math.cos(angle)
         self.vy = speed * math.sin(angle)
+
+    def _register_action(self, action, transient=True):
+        """登记一次触发的动作，用于防连发冷却。
+
+        transient=True（进入有持续时间的姿态状态：looking/pausing/idle/...）：
+          记为上一动作，并在 ACTION_REPEAT_BLOCK 帧内禁止重复触发；同时强制
+          ACTION_GAP 帧的"安静爬行"间隔，避免动作连发、刷新过快。
+        transient=False（turn 瞬时转向）：不参与冷却，避免频繁转向抑制其它行为。
+        """
+        if transient:
+            self._last_action = action
+            self._repeat_block = ACTION_REPEAT_BLOCK
+            self._action_gap = ACTION_GAP
 
     def _hits_window(self, x, y):
         pet_rect = (x, y, x + SPRITE_W, y + SPRITE_H)
@@ -1343,6 +1387,8 @@ class SettingsDialog:
         ("招手概率", "wave_chance", 0.0, 0.005, 0.0001),
         ("眨眼概率", "blink_chance", 0.0, 0.02, 0.0005),
         ("空闲气泡概率", "idle_bubble_chance", 0.0, 0.005, 0.0001),
+        ("动作间隔冷却(帧)", "action_gap", 0, 120, 1),
+        ("同动作冷却(帧)", "action_repeat_block", 0, 600, 5),
         ("气泡时长(ms)", "bubble_duration_ms", 800, 6000, 100),
     ]
     # (标签, 配置键)
@@ -1393,7 +1439,7 @@ class SettingsDialog:
                 data[key] = var.get()
             else:
                 val = var.get()
-                if key in ('bubble_duration_ms',):
+                if key in ('bubble_duration_ms', 'action_gap', 'action_repeat_block'):
                     val = int(round(val))
                 data[key] = val
         return data

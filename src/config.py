@@ -39,6 +39,11 @@ DEFAULTS = {
     "pause_duration": [40, 120],
     "look_duration": [50, 150],
     "dir_change_chance": 0.012,
+    # 防连发冷却（E：避免同一动作被连续触发导致刷新过快）
+    # 动作（如张望）结束后，强制安静爬行 action_gap 帧，再允许下一次动作；
+    # 同一动作在 action_repeat_block 帧窗口内禁止再次触发。
+    "action_gap": 30,
+    "action_repeat_block": 240,
     # 空闲 / 随机行为（C：行为丰富度）
     "idle_chance": 0.0008,
     "idle_duration": [60, 160],

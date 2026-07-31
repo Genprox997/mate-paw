@@ -33,6 +33,50 @@ def test_choose_crawl_action_middle_bucket():
     assert dp.choose_crawl_action(r, 0.1, 0.1, 0.1, 0.1, 0.1, 0.0, 0.0) == 'sleep'
 
 
+def test_choose_crawl_action_excludes_action():
+    # 排除 look 且其桶命中时，应被跳过；其余桶全 0 -> 返回 None（继续爬行）
+    assert dp.choose_crawl_action(0.05, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                  exclude='look') is None
+    # 排除 turn，但 look 桶仍命中 -> 返回 look
+    assert dp.choose_crawl_action(0.05, 0.0, 0.1, 0.1, 0.0, 0.0, 0.0, 0.0,
+                                  exclude='turn') == 'look'
+
+
+def test_no_immediate_repeat_after_look(char_dir, tk_canvas, monkeypatch):
+    """防连发核心用例：张望结束后应有一段"安静爬行"间隔，且同动作在冷却窗口内不再触发。"""
+    pet = _new_pet(char_dir, tk_canvas)
+    # 仅"张望"可触发，其余动作概率归零；r=0 必命中第一个非空桶(look)
+    monkeypatch.setattr(dp, 'PAUSE_CHANCE', 0.0)
+    monkeypatch.setattr(dp, 'LOOK_CHANCE', 1.0)
+    monkeypatch.setattr(dp, 'DIR_CHANGE_CHANCE', 0.0)
+    monkeypatch.setattr(dp, 'IDLE_CHANCE', 0.0)
+    monkeypatch.setattr(dp, 'SLEEP_CHANCE', 0.0)
+    monkeypatch.setattr(dp, 'WAVE_CHANCE', 0.0)
+    monkeypatch.setattr(dp, 'BLINK_CHANCE', 0.0)
+    monkeypatch.setattr(dp, 'LOOK_DURATION', (5, 5))
+    monkeypatch.setattr(dp, 'ACTION_GAP', 10)
+    monkeypatch.setattr(dp, 'ACTION_REPEAT_BLOCK', 40)
+    monkeypatch.setattr(dp.random, 'random', lambda: 0.0)
+
+    # 第一帧即进入 looking
+    pet.update(paused=False)
+    assert pet.state == 'looking'
+
+    # 推进到 looking 结束、回到 crawling
+    while pet.state != 'crawling':
+        pet.update(paused=False)
+
+    # 紧接其后的 ACTION_GAP(10) 帧内不应触发任何动作（保持 crawling）
+    for _ in range(10):
+        pet.update(paused=False)
+        assert pet.state == 'crawling'
+
+    # 在 repeat_block 余量内（此处再走 25 帧，合计 < 40），look 不应再被触发
+    for _ in range(25):
+        pet.update(paused=False)
+        assert pet.state != 'looking'
+
+
 def test_facing_toward():
     assert dp.facing_toward(100, 200) is True   # 目标在右 -> 朝右
     assert dp.facing_toward(100, 50) is False   # 目标在左 -> 朝左
@@ -259,6 +303,10 @@ def test_sprite_cache_eviction_respects_max(tk_root):
 def test_render_key_skip_avoids_rebuild(char_dir, tk_canvas, monkeypatch):
     """渲染键未变时不应重建 PhotoImage（itemconfig(image=) 不应再次被调用）。"""
     pet = _new_pet(char_dir, tk_canvas)
+    # 隔离窗口检测：否则无头测试里宠物随机初始位置可能"撞到"真实 OS 窗口，
+    # 触发 _random_turn() 翻转朝向 —— 那是一次合法的重建（精灵需翻转），
+    # 会让本用例误判。这里假定无窗口，专注于验证"键不变 -> 跳过重建"。
+    monkeypatch.setattr(dp, 'get_window_rects', lambda: [])
     monkeypatch.setattr(dp.random, 'random', lambda: 0.999)  # 爬行中不发生状态切换
     calls = []
     orig = pet.canvas.itemconfig

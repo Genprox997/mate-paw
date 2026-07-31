@@ -21,6 +21,8 @@
     150
   ],
   "dir_change_chance": 0.012,
+  "action_gap": 30,
+  "action_repeat_block": 240,
   "idle_chance": 0.0008,
   "idle_duration": [
     60,
