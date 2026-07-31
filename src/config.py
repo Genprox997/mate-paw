@@ -44,6 +44,13 @@ DEFAULTS = {
     # 同一动作在 action_repeat_block 帧窗口内禁止再次触发。
     "action_gap": 30,
     "action_repeat_block": 240,
+    # 朝向翻转保护（F：避免精灵一秒内多次左右镜像导致观感差）
+    # facing_flip_cooldown：两次翻转之间的最低帧间隔（30fps 下 15 帧≈0.5s，即最多 2 次/秒）；
+    # facing_vx_threshold：水平速度死区，|vx| 小于该值视为无明显水平方向，保持当前朝向；
+    # facing_cursor_threshold：看向光标时，光标与宠物中心横向距离小于该值不翻转（像素）。
+    "facing_flip_cooldown": 15,
+    "facing_vx_threshold": 0.4,
+    "facing_cursor_threshold": 20,
     # 空闲 / 随机行为（C：行为丰富度）
     "idle_chance": 0.0008,
     "idle_duration": [60, 160],

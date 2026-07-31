@@ -23,6 +23,9 @@
   "dir_change_chance": 0.012,
   "action_gap": 30,
   "action_repeat_block": 240,
+  "facing_flip_cooldown": 15,
+  "facing_vx_threshold": 0.4,
+  "facing_cursor_threshold": 20,
   "idle_chance": 0.0008,
   "idle_duration": [
     60,

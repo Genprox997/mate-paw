@@ -6,6 +6,7 @@ Canvas 构造（本环境 Tk 可无显示创建），资源图用 PIL 现画纯�
 import os
 import sys
 import time
+import math
 
 import pytest
 from PIL import Image
@@ -365,3 +366,107 @@ def test_update_window_region_skips_when_unchanged(monkeypatch):
     app._update_window_region(app)
     app._update_window_region(app)
     assert counter['n'] == 1  # 第二次因签名未变被跳过
+
+
+# ---------------------------------------------------------------------------
+# 转向防频繁左右翻转（E 的延伸）：_random_turn 应为小幅偏转
+# ---------------------------------------------------------------------------
+def test_random_turn_is_gentle(char_dir, tk_canvas):
+    """_random_turn 应在当前朝向附近小幅偏转，而非瞬间随机到任意方向。
+
+    单次转向的偏转角 <= max_delta(60°)，因此从朝右直行(vx>0)出发**绝不会**
+    左右翻转（cos(±60°)>0）；只有被窗口卡死(full=True)才允许大幅转向。
+    这是修复"频繁左右换向 / 刷新过快"的核心。
+    """
+    pet = _new_pet(char_dir, tk_canvas)
+    max_delta = math.pi / 3
+    for _ in range(100):
+        pet.vx, pet.vy = 3.0, 0.0  # 朝右直行
+        pet._random_turn()
+        # 偏转被限制在 [-60°, 60°] -> 速度仍朝右，精灵不翻转
+        assert pet.vx > 0
+        new = math.atan2(pet.vy, pet.vx)
+        assert abs(new) <= max_delta + 1e-9
+        # 速度幅度保持不变（仍在爬行速度区间内）
+        assert math.hypot(pet.vx, pet.vy) == pytest.approx(3.0, rel=1e-6)
+    # full=True：被窗口卡死脱困，允许大幅转向（不保证不翻转），但速度幅度仍保持
+    pet.vx, pet.vy = 3.0, 0.0
+    pet._random_turn(full=True)
+    assert math.hypot(pet.vx, pet.vy) == pytest.approx(3.0, rel=1e-6)
+
+
+def test_move_escapes_window_and_keeps_speed(char_dir, tk_canvas, monkeypatch):
+    """撞窗后 _move 应沿当前朝向附近找到可行方向脱困，且速度幅度不变（不退化/不卡死）。"""
+    pet = _new_pet(char_dir, tk_canvas)
+    # 正前方一堵竖直墙（占满高度），只能掉头脱困
+    wall = (410, 0, 430, 600)
+    monkeypatch.setattr(dp, 'get_window_rects', lambda: [wall])
+    pet.x, pet.y = 228, 170
+    pet.vx, pet.vy = 3.0, 0.0  # 向右撞墙
+    pet.screen_w, pet.screen_h = 800, 600
+    pet._move()
+    pr = (pet.x, pet.y, pet.x + dp.SPRITE_W, pet.y + dp.SPRITE_H)
+    assert not dp.rects_overlap(pr, wall)  # 已脱困
+    assert math.hypot(pet.vx, pet.vy) == pytest.approx(3.0, rel=1e-6)  # 速度幅度保持
+
+
+# ---------------------------------------------------------------------------
+# 朝向翻转冷却与死区（F：避免精灵一秒内多次左右镜像）
+# ---------------------------------------------------------------------------
+def test_set_facing_cooldown_blocks_rapid_flip(char_dir, tk_canvas):
+    """翻转后进入冷却，冷却期内即便方向信号反转也不应再翻。"""
+    pet = _new_pet(char_dir, tk_canvas)
+    pet.facing_right = True
+    pet._facing_cooldown = 0
+    # 第一次：明确朝左 -> 翻转一次，进入冷却
+    pet._set_facing(False, clear=True)
+    assert pet.facing_right is False
+    assert pet._facing_cooldown == dp.FACING_FLIP_COOLDOWN
+    # 冷却期内：即便明确朝右，也不翻（冷却优先）
+    for _ in range(dp.FACING_FLIP_COOLDOWN):
+        pet._set_facing(True, clear=True)
+        assert pet.facing_right is False  # 仍朝左
+    # 冷却耗尽后：明确朝右 -> 这次才翻
+    pet._set_facing(True, clear=True)
+    assert pet.facing_right is True
+
+
+def test_set_facing_deadzone_keeps_current(char_dir, tk_canvas):
+    """clear=False（无明确方向 / |vx| 过小）时保持当前朝向，不翻转。"""
+    pet = _new_pet(char_dir, tk_canvas)
+    pet.facing_right = True
+    pet._facing_cooldown = 0
+    # 期望朝左但无明确方向信号 -> 死区，保持朝右
+    pet._set_facing(False, clear=False)
+    assert pet.facing_right is True
+    # 明确朝左且无冷却 -> 翻转
+    pet._set_facing(False, clear=True)
+    assert pet.facing_right is False
+
+
+def test_move_near_vertical_does_not_flicker(char_dir, tk_canvas, monkeypatch):
+    """近垂直运动（vx 极小且符号反复变）时 facing 不应每帧翻转。
+
+    模拟撞窗规避每帧把 vx 在 +0.01 / -0.01 间反复横跳的场景：
+    修复前 facing 每帧变（30 次/秒闪烁），修复后因死区+冷却保持稳定。
+    """
+    pet = _new_pet(char_dir, tk_canvas)
+    monkeypatch.setattr(dp, 'get_window_rects', lambda: [])
+    pet.screen_w, pet.screen_h = 800, 600
+    pet.x, pet.y = 300, 300
+    pet.facing_right = True
+    pet._facing_cooldown = 0
+    # vx 在正负 0.01 间反复横跳（小于 FACING_VX_THRESHOLD 死区）
+    flips = 0
+    prev = pet.facing_right
+    for i in range(60):
+        pet.vx = 0.01 if i % 2 == 0 else -0.01
+        pet.vy = 2.5
+        pet._move()
+        if pet.facing_right != prev:
+            flips += 1
+            prev = pet.facing_right
+    # 死区内不应翻转（vx 幅度 0.01 < 阈值 0.4）
+    assert flips == 0
+    assert pet.facing_right is True  # 保持初始朝向
+

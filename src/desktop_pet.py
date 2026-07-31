@@ -61,7 +61,8 @@ def apply_config(cfg):
         PAUSE_CHANCE, LOOK_CHANCE, PAUSE_DURATION, LOOK_DURATION, DIR_CHANGE_CHANCE, \
         IDLE_CHANCE, IDLE_DURATION, SLEEP_CHANCE, SLEEP_DURATION, WAVE_CHANCE, \
         WAVE_DURATION, BLINK_CHANCE, BLINK_DURATION, IDLE_BUBBLE_CHANCE, \
-        FOLLOW_CURSOR, TAP_REACT, POKE_BUBBLE, ACTION_GAP, ACTION_REPEAT_BLOCK
+        FOLLOW_CURSOR, TAP_REACT, POKE_BUBBLE, ACTION_GAP, ACTION_REPEAT_BLOCK, \
+        FACING_FLIP_COOLDOWN, FACING_VX_THRESHOLD, FACING_CURSOR_THRESHOLD
     SPRITE_W = cfg.sprite_w
     SPRITE_H = cfg.sprite_h
     FPS = cfg.fps
@@ -93,6 +94,9 @@ def apply_config(cfg):
     POKE_BUBBLE = str(cfg.poke_bubble)
     ACTION_GAP = int(cfg.action_gap)
     ACTION_REPEAT_BLOCK = int(cfg.action_repeat_block)
+    FACING_FLIP_COOLDOWN = int(cfg.facing_flip_cooldown)
+    FACING_VX_THRESHOLD = float(cfg.facing_vx_threshold)
+    FACING_CURSOR_THRESHOLD = int(cfg.facing_cursor_threshold)
     setup_logging(cfg.log_level)
 
 
@@ -625,6 +629,8 @@ class MatePaw:
         self._last_action = None        # 上一个触发的瞬时动作（turn 不入）
         self._repeat_block = 0          # 该动作禁止重复的剩余帧数
         self._action_gap = 0            # 强制安静爬行（不触发任何动作）的剩余帧数
+        # 朝向翻转冷却（F：避免精灵一秒内多次左右镜像）
+        self._facing_cooldown = 0       # 距离下次允许翻转的剩余帧数
         self.dragging = False
         self.visible = True
         self.cursor_x = None       # 由主循环每帧写入的鼠标屏幕 x（看向光标用）
@@ -705,8 +711,12 @@ class MatePaw:
 
             # 空闲张望时看向光标（若开启且能取到光标位置）
             if self.state == 'looking' and FOLLOW_CURSOR and self.cursor_x is not None:
-                self.facing_right = facing_toward(
-                    self.x + SPRITE_W / 2, self.cursor_x)
+                # 同样带死区+冷却：光标几乎正上方时不翻，避免宠物在光标下方微移时左右闪烁
+                pet_cx = self.x + SPRITE_W / 2
+                self._set_facing(
+                    facing_toward(pet_cx, self.cursor_x),
+                    clear=abs(self.cursor_x - pet_cx) >= FACING_CURSOR_THRESHOLD,
+                )
 
             # 空闲随机气泡（D）：当前没有气泡显示时才按概率冒一句
             if IDLE_BUBBLE_CHANCE > 0 and self.bubble_until < time.time():
@@ -734,23 +744,31 @@ class MatePaw:
             ny = self.screen_h - SPRITE_H; self.vy = -abs(self.vy)
 
         if self._hits_window(nx, ny):
+            speed = max(speed, CRAWL_SPEED_MIN)
+            cur = math.atan2(self.vy, self.vx)
             placed = False
-            for _ in range(10):
-                ang = random.uniform(0, 2 * math.pi)
-                sp = max(speed, CRAWL_SPEED_MIN)
-                tx = min(max(self.x + sp * math.cos(ang), 0), self.screen_w - SPRITE_W)
-                ty = min(max(self.y + sp * math.sin(ang), 0), self.screen_h - SPRITE_H)
-                if not self._hits_window(tx, ty):
-                    nx, ny = tx, ty
-                    self.vx = sp * math.cos(ang)
-                    self.vy = sp * math.sin(ang)
-                    placed = True
+            # 优先沿「当前朝向附近」找可行方向（保持行进方向稳定、减少左右翻转），
+            # 角度范围逐步放宽；仅在被窗口完全围死时才全随机脱困。
+            for spread in (math.pi / 6, math.pi / 3, math.pi / 2, math.pi):
+                for _ in range(6):
+                    ang = cur + random.uniform(-spread, spread)
+                    tx = min(max(self.x + speed * math.cos(ang), 0), self.screen_w - SPRITE_W)
+                    ty = min(max(self.y + speed * math.sin(ang), 0), self.screen_h - SPRITE_H)
+                    if not self._hits_window(tx, ty):
+                        nx, ny = tx, ty
+                        self.vx = speed * math.cos(ang)
+                        self.vy = speed * math.sin(ang)
+                        placed = True
+                        break
+                if placed:
                     break
             if not placed:
-                self._random_turn()
+                self._random_turn(full=True)
 
         self.x, self.y = nx, ny
-        self.facing_right = self.vx > 0
+        # 朝向更新带阈值死区 + 冷却（F）：|vx| 过小（近垂直）不翻，
+        # 且两次翻转间至少隔 FACING_FLIP_COOLDOWN 帧，杜绝高频镜像闪烁。
+        self._set_facing(self.vx > 0, clear=abs(self.vx) >= FACING_VX_THRESHOLD)
 
     def _enter_state(self, state, duration_range=None):
         self.state = state
@@ -767,10 +785,20 @@ class MatePaw:
             self.vx = speed * math.cos(angle)
             self.vy = speed * math.sin(angle)
 
-    def _random_turn(self):
-        angle = random.uniform(0, 2 * math.pi)
-        speed = math.sqrt(self.vx ** 2 + self.vy ** 2)
+    def _random_turn(self, full=False, max_delta=math.pi / 3):
+        """转向：在**当前朝向附近**做小幅偏转，而不是瞬间随机到全新方向。
+
+        爬行中的人物因此是「自然游走」，左右换向频率大幅下降，避免精灵频繁
+        翻转刷新（这是之前观感差的根因之一）。
+        仅当被窗口卡死（full=True，需要强行脱困）时才使用全随机方向。
+        """
+        speed = math.sqrt(self.vx ** 2 + self.vy ** 2) or CRAWL_SPEED_MIN
         speed = max(CRAWL_SPEED_MIN, min(CRAWL_SPEED_MAX, speed))
+        if full:
+            angle = random.uniform(0, 2 * math.pi)
+        else:
+            cur = math.atan2(self.vy, self.vx)
+            angle = cur + random.uniform(-max_delta, max_delta)
         self.vx = speed * math.cos(angle)
         self.vy = speed * math.sin(angle)
 
@@ -786,6 +814,24 @@ class MatePaw:
             self._last_action = action
             self._repeat_block = ACTION_REPEAT_BLOCK
             self._action_gap = ACTION_GAP
+
+    def _set_facing(self, want_right, clear=False):
+        """带迟滞与冷却的朝向更新，避免精灵一秒内多次左右镜像导致观感差。
+
+        want_right: 期望朝向（True=朝右）。
+        clear: 是否有「明确方向信号」。为 False 时进入死区——保持当前朝向，
+            用于水平速度过小（近垂直运动）或光标距宠物过近等无明确方向场景。
+        朝向真正改变后进入 FACING_FLIP_COOLDOWN 帧冷却，期间禁止再翻，
+        保证最低翻转间隔（30fps、cooldown=15 时每秒最多 2 次）。
+        """
+        if self._facing_cooldown > 0:
+            self._facing_cooldown -= 1
+            return
+        if not clear:
+            return  # 无明确方向，保持当前朝向（迟滞死区）
+        if bool(want_right) != self.facing_right:
+            self.facing_right = bool(want_right)
+            self._facing_cooldown = FACING_FLIP_COOLDOWN
 
     def _hits_window(self, x, y):
         pet_rect = (x, y, x + SPRITE_W, y + SPRITE_H)
