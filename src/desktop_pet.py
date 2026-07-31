@@ -1091,6 +1091,8 @@ class MatePawApp:
                 log.warning(f"Warning: style: {e}")
         # 初始 region：根据可见宠物集合随时更新
         self._update_window_region()
+        # 启动屏幕尺寸/DPI 看门狗（应对全屏 UWP 应用打开关闭导致的显示瞬变）
+        self.root.after(2000, self._watchdog_screen_size)
 
     def _update_window_region(self):
         """把窗口的可点击区域限制为可见宠物矩形的并集。
@@ -1106,6 +1108,11 @@ class MatePawApp:
             return
         try:
             rects = compute_pet_rects(self.pets, self.screen_w, self.screen_h)
+            # 有可见宠物却算出空矩形并集 → 瞬态异常（屏幕尺寸/坐标瞬时异常、
+            # 或某帧宠物被钳制到越界）。此时保留上一帧的有效 region，绝不把
+            # region 设空（空 region 会令整窗不可见，桌宠整体消失且无法自行恢复）。
+            if not rects and any(p.visible for p in self.pets):
+                return
             sig = tuple(rects)
             if sig == self._region_sig:
                 return
@@ -1124,6 +1131,42 @@ class MatePawApp:
             set_window_region_fullscreen(self.hwnd, self.screen_w, self.screen_h)
         except Exception:
             pass
+
+    def _watchdog_screen_size(self):
+        """屏幕尺寸/DPI 看门狗：周期性重查屏幕分辨率，应对全屏 UWP 应用（如
+        Windows「照片」）打开/关闭时触发的显示设置瞬变。
+
+        若分辨率发生变化：① 更新 self.screen_w/h 与各宠物的 screen_w/h；
+        ② 把越界宠物钳回可视区（否则 compute_pet_rects 会算出空并集，
+        配合空 region 缺陷令整窗消失）；③ 重置 _region_sig 强制刷新可点区域；
+        ④ 重新置顶 -topmost（UWP 全屏退出后顶层状态可能丢失）。
+        """
+        try:
+            sw, sh = get_screen_size()
+            if (sw, sh) != (self.screen_w, self.screen_h) and sw > 0 and sh > 0:
+                log.info(f"[mate_paw] 屏幕尺寸变化 {self.screen_w}x{self.screen_h} -> {sw}x{sh}，重定位宠物")
+                self.screen_w, self.screen_h = sw, sh
+                changed = False
+                for pet in self.pets:
+                    pet.screen_w, pet.screen_h = sw, sh
+                    nx = min(max(pet.x, 0), max(0, sw - SPRITE_W))
+                    ny = min(max(pet.y, 0), max(0, sh - SPRITE_H))
+                    if nx != pet.x or ny != pet.y:
+                        pet.x, pet.y = nx, ny
+                        changed = True
+                # 强制下一次 _update_window_region 重建 region（否则 sig 未变会跳过）
+                self._region_sig = None
+                if self.hwnd:
+                    try:
+                        self.root.attributes('-topmost', True)
+                    except Exception:
+                        pass
+                self._update_window_region()
+        except Exception as e:
+            log.debug(f"[mate_paw] screen watchdog error: {e}")
+        finally:
+            # 每 2 秒轮询一次（轻量；失败也不影响主循环）
+            self.root.after(2000, self._watchdog_screen_size)
 
     def _bind_canvas_events(self):
         """在 canvas 上绑定宠物拖动/释放/右键事件 —— 替代之前依赖鼠标钩子的方案。"""

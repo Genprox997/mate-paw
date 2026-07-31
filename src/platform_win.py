@@ -77,7 +77,16 @@ if HAS_WIN32:
 
         rects: list of (x1, y1, x2, y2)。SetWindowRgn 接管 region 所有权，
         下次调用或销毁窗口时由系统自动释放（故 combined 不再 DeleteObject）。
+
+        关键：rects 为空时**绝不能**创建零尺寸 region —— 空 region 会让整个
+        Toplevel 窗口变成不可见/不可交互（桌宠整体消失且无法恢复）。此时改为
+        SetWindowRgn(hwnd, NULL) 移除限制，使整窗可见（透明背景区域仍透明，
+        仅失去"点击穿透"，但桌宠不会消失）。
         """
+        if not rects:
+            # 无矩形并集：移除 region 限制（整窗可见），避免空 region 使窗口消失。
+            user32.SetWindowRgn(hwnd, None, 1)
+            return
         combined = gdi32.CreateRectRgn(0, 0, 0, 0)
         for (x1, y1, x2, y2) in rects:
             if x2 <= x1 or y2 <= y1:
