@@ -242,11 +242,13 @@ def get_res_dir():
 
 
 def chroma_key(im, tolerance=None):
-    """色键去背景：采样四角+四边中点作为背景色，移除与之接近的像素。
+    """色键去背景：边缘泛洪填充（flood-fill），仅移除与边缘相连的背景色像素。
 
-    与旧 remove_light_bg（固定阈值 248 会误删白色衣服）不同：
-      - 仅对不透明像素判定，透明 PNG（如 rembg 产出）直接跳过，前景白衣服得以保留；
-      - 背景色取自图片边缘采样的中位数，适配任意背景色，而非只认纯白。
+    与旧版全局颜色匹配不同：
+      - 从图像边缘开始泛洪，只移除「与边缘连通」的背景像素；
+      - 人物内部浅色区域（白裤子、皮肤高光等）因不连通到边缘而保留，
+        不会出现身体空洞。
+      - 透明 PNG（如 rembg 产出）边缘全透明时直接跳过。
     tolerance 为 RGB 欧氏距离阈值，默认取 CONFIG.chroma_tolerance。
     """
     if im.mode != 'RGBA':
@@ -262,19 +264,57 @@ def chroma_key(im, tolerance=None):
     gs = [px[x, y][1] for (x, y) in pts if px[x, y][3] > 10]
     bs = [px[x, y][2] for (x, y) in pts if px[x, y][3] > 10]
     if not rs:
-        return im  # 边缘全透明：已是透明图，无需处理（白衣服等前景保留）
+        return im  # 边缘全透明：已是透明图，无需处理
     br = sorted(rs)[len(rs) // 2]
     bg = sorted(gs)[len(gs) // 2]
     bb = sorted(bs)[len(bs) // 2]
+
+    # 泛洪填充：从边缘出发，仅标记与边缘连通且颜色接近背景的像素为「待移除」
+    t2 = tolerance * tolerance
+    visited = [[False] * w for _ in range(h)]
+    to_remove = [[False] * w for _ in range(h)]
+    from collections import deque
+    queue = deque()
+
+    # 种子：所有边缘位置中不透明且颜色接近背景的像素
+    for x in range(w):
+        for y in (0, h - 1):
+            if px[x, y][3] > 10:
+                r, g, b, _ = px[x, y]
+                if (r - br) ** 2 + (g - bg) ** 2 + (b - bb) ** 2 <= t2:
+                    visited[y][x] = True
+                    to_remove[y][x] = True
+                    queue.append((x, y))
+    for y in range(h):
+        for x in (0, w - 1):
+            if visited[y][x]:
+                continue
+            if px[x, y][3] > 10:
+                r, g, b, _ = px[x, y]
+                if (r - br) ** 2 + (g - bg) ** 2 + (b - bb) ** 2 <= t2:
+                    visited[y][x] = True
+                    to_remove[y][x] = True
+                    queue.append((x, y))
+
+    # BFS 泼扩散
+    while queue:
+        cx, cy = queue.popleft()
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < w and 0 <= ny < h and not visited[ny][nx]:
+                visited[ny][nx] = True
+                r, g, b, a = px[nx, ny]
+                if a > 10 and (r - br) ** 2 + (g - bg) ** 2 + (b - bb) ** 2 <= t2:
+                    to_remove[ny][nx] = True
+                    queue.append((nx, ny))
+
+    # 仅将泛洪标记的像素透明化（内部不连通区域保留）
     out = im.copy()
     op = out.load()
-    t2 = tolerance * tolerance
     for y in range(h):
         for x in range(w):
-            r, g, b, a = op[x, y]
-            if a == 0:
-                continue
-            if (r - br) ** 2 + (g - bg) ** 2 + (b - bb) ** 2 <= t2:
+            if to_remove[y][x]:
+                r, g, b, _ = op[x, y]
                 op[x, y] = (r, g, b, 0)
     return out
 
