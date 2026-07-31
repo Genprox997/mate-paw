@@ -364,11 +364,15 @@ def rects_overlap(r1, r2):
     return not (r1[2] <= r2[0] or r1[0] >= r2[2] or r1[3] <= r2[1] or r1[1] >= r2[3])
 
 
-def compute_pet_rects(pets, screen_w, screen_h):
+def compute_pet_rects(pets, screen_w, screen_h, now=None):
     """收集所有可见宠物在屏幕坐标下的矩形并集（窗口局部点击区域用）。
 
     纯函数（不依赖 Tk / win32），便于单测「布局未变 -> 签名不变 -> 跳过 SetWindowRgn」。
+    当传入 now 时，还会把各宠物的活跃气泡矩形一并纳入，避免 SetWindowRgn
+    把窗口裁剪成只有宠物身体区域而导致气泡被系统裁掉不可见。
     """
+    import time as _time
+    _now = now if now is not None else _time.time()
     rects = []
     for pet in pets:
         if not pet.visible:
@@ -380,6 +384,24 @@ def compute_pet_rects(pets, screen_w, screen_h):
         if x2 <= x1 or y2 <= y1:
             continue
         rects.append((x1, y1, x2, y2))
+        # 纳入活跃气泡矩形，防止 SetWindowRgn 将气泡区域裁掉
+        if (getattr(pet, 'bubble_until', None) and _now < pet.bubble_until
+                and getattr(pet, 'bubble_photo', None) and hasattr(pet, 'bubble_w')):
+            bx = pet.x + SPRITE_W // 2
+            top_y = pet.y - pet.bubble_h // 2 - 10
+            if top_y < pet.bubble_h // 2 + 4:
+                by = pet.y + SPRITE_H + pet.bubble_h // 2 + 10
+            else:
+                by = top_y
+            by = min(by, screen_h - pet.bubble_h // 2 - 4)
+            bw_half = pet.bubble_w // 2
+            bh_half = pet.bubble_h // 2
+            b_x1 = max(0, int(bx - bw_half))
+            b_y1 = max(0, int(by - bh_half))
+            b_x2 = min(screen_w, int(bx + bw_half))
+            b_y2 = min(screen_h, int(by + bh_half))
+            if b_x2 > b_x1 and b_y2 > b_y1:
+                rects.append((b_x1, b_y1, b_x2, b_y2))
     return rects
 
 
@@ -1137,7 +1159,8 @@ class MatePawApp:
         if not self.hwnd or self.drag:
             return
         try:
-            rects = compute_pet_rects(self.pets, self.screen_w, self.screen_h)
+            rects = compute_pet_rects(self.pets, self.screen_w, self.screen_h,
+                                       now=time.time())
             # 有可见宠物却算出空矩形并集 → 瞬态异常（屏幕尺寸/坐标瞬时异常、
             # 或某帧宠物被钳制到越界）。此时保留上一帧的有效 region，绝不把
             # region 设空（空 region 会令整窗不可见，桌宠整体消失且无法自行恢复）。
