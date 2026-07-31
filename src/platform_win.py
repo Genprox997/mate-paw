@@ -157,6 +157,54 @@ if HAS_WIN32:
             user32.UnhookWindowsHookEx(hook)
         user32.PostQuitMessage(0)
 
+    user32.GetLayeredWindowAttributes.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_byte), ctypes.POINTER(ctypes.c_uint),
+    ]
+    user32.GetLayeredWindowAttributes.restype = ctypes.c_int
+    user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    user32.ShowWindow.restype = ctypes.c_int
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.restype = ctypes.c_int
+
+    def is_window_visible(hwnd):
+        """窗口当前是否可见（被最小化/隐藏返回 False）。"""
+        try:
+            return bool(user32.IsWindowVisible(hwnd))
+        except Exception:
+            return True
+
+    def get_window_exstyle(hwnd):
+        """返回扩展样式；用于判断 WS_EX_LAYERED 是否仍生效。"""
+        try:
+            return win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        except Exception:
+            return 0
+
+    def get_layered_colorkey(hwnd):
+        """返回分层颜色键的 COLORREF（如 0x00f0f0f0）；未分层/无颜色键/出错返回 None。
+
+        用于检测「颜色键透明」是否被 DWM 重置：失效时返回 0 或 None。
+        """
+        try:
+            pcr = ctypes.c_uint()
+            pa = ctypes.c_byte()
+            pf = ctypes.c_uint()
+            if user32.GetLayeredWindowAttributes(
+                hwnd, ctypes.byref(pcr), ctypes.byref(pa), ctypes.byref(pf)
+            ):
+                return pcr.value
+        except Exception:
+            pass
+        return None
+
+    def show_window(hwnd):
+        """把可能被隐藏/最小化的窗口重新显示（SW_SHOW=5）。"""
+        try:
+            user32.ShowWindow(hwnd, 5)
+        except Exception:
+            pass
+
 else:
     # -------- 非 Windows 平台：安全空实现，保证可 import / 可测试 --------
     WH_MOUSE_LL = 14
@@ -189,4 +237,16 @@ else:
         return None, None, None
 
     def uninstall_mouse_hook(hook):
+        pass
+
+    def is_window_visible(hwnd):
+        return True
+
+    def get_window_exstyle(hwnd):
+        return 0
+
+    def get_layered_colorkey(hwnd):
+        return None
+
+    def show_window(hwnd):
         pass

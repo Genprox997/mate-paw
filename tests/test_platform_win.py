@@ -34,6 +34,18 @@ def test_enum_window_rects_returns_list():
     assert isinstance(rects, list)
 
 
+def test_window_health_helpers_no_crash():
+    # 用无效句柄调用也不应抛异常，且返回类型正确
+    vis = platform_win.is_window_visible(12345)
+    assert isinstance(vis, bool)
+    ex = platform_win.get_window_exstyle(12345)
+    assert isinstance(ex, int)
+    ck = platform_win.get_layered_colorkey(12345)
+    assert ck is None or isinstance(ck, int)
+    # show_window 空实现 / 真实 win32 调用都不应抛
+    platform_win.show_window(12345)
+
+
 def test_set_window_region_empty_uses_null_not_empty_region():
     """空 rects 必须移除 region（SetWindowRgn(hwnd, NULL)）而不是创建零尺寸 region。
 

@@ -34,6 +34,10 @@ from platform_win import (
     enum_window_rects,
     install_mouse_hook,
     uninstall_mouse_hook,
+    is_window_visible,
+    get_window_exstyle,
+    get_layered_colorkey,
+    show_window,
     MSLLHOOKSTRUCT,
     WM_LBUTTONDOWN,
     WM_LBUTTONUP,
@@ -1050,6 +1054,7 @@ class MatePawApp:
         self.tray = None
         self.hwnd = None  # 主窗口句柄，用于 SetWindowRgn
         self._region_sig = None  # 窗口可点区域签名缓存（未变则跳过 SetWindowRgn）
+        self._health_tick = 0    # 窗口健康看门狗节拍计数
         self.paused = False  # 全局暂停：宠物停止爬行但保持显示/呼吸
         self.state_path = state_path()  # 状态持久化文件路径
         # 鼠标钩子内用于跟踪是否吞掉右键事件（仅由钩子线程读写，避免竞态）
@@ -1091,8 +1096,8 @@ class MatePawApp:
                 log.warning(f"Warning: style: {e}")
         # 初始 region：根据可见宠物集合随时更新
         self._update_window_region()
-        # 启动屏幕尺寸/DPI 看门狗（应对全屏 UWP 应用打开关闭导致的显示瞬变）
-        self.root.after(2000, self._watchdog_screen_size)
+        # 启动屏幕尺寸/DPI + 窗口健康看门狗（应对全屏 UWP 应用打开关闭导致的显示瞬变/透明丢失）
+        self.root.after(1000, self._watchdog_screen_size)
 
     def _update_window_region(self):
         """把窗口的可点击区域限制为可见宠物矩形的并集。
@@ -1132,41 +1137,98 @@ class MatePawApp:
         except Exception:
             pass
 
-    def _watchdog_screen_size(self):
-        """屏幕尺寸/DPI 看门狗：周期性重查屏幕分辨率，应对全屏 UWP 应用（如
-        Windows「照片」）打开/关闭时触发的显示设置瞬变。
+    def _refresh_window_style(self):
+        """强制重应用窗口关键样式 —— 应对全屏 UWP 应用（Windows「照片」）打开/关闭时
+        DWM 重置导致桌宠整体消失（窗口被隐藏、WS_EX_LAYERED 颜色键透明失效、顶层丢失）。
 
-        若分辨率发生变化：① 更新 self.screen_w/h 与各宠物的 screen_w/h；
-        ② 把越界宠物钳回可视区（否则 compute_pet_rects 会算出空并集，
-        配合空 region 缺陷令整窗消失）；③ 重置 _region_sig 强制刷新可点区域；
-        ④ 重新置顶 -topmost（UWP 全屏退出后顶层状态可能丢失）。
+        恢复项：
+          - 窗口可见性（被隐藏则 ShowWindow 恢复）
+          - -topmost 置顶
+          - 颜色键透明：先关后开 -transparentcolor，绕过 Tk「值未变就跳过 SetLayeredWindowAttributes」
+            的优化，确保即使 DWM 已清掉颜色键也能真正重新写入
+          - WS_EX_LAYERED | WS_EX_TOOLWINDOW（set_layered_tool_window）
+          - 可点区域 region（置 None 强制重建）
+        """
+        if not self.hwnd:
+            return
+        try:
+            show_window(self.hwnd)
+        except Exception:
+            pass
+        try:
+            self.root.attributes('-topmost', True)
+        except Exception:
+            pass
+        try:
+            # 关键：先禁用再启用，强制 Tk 重新调用 SetLayeredWindowAttributes，
+            # 否则 Tk 认为 -transparentcolor 未变会跳过写入，无法修复已失效的颜色键。
+            self.root.attributes('-transparentcolor', '')
+            self.root.attributes('-transparentcolor', '#f0f0f0')
+        except Exception:
+            pass
+        try:
+            set_layered_tool_window(self.hwnd)
+        except Exception:
+            pass
+        # 重新设置可点区域
+        self._region_sig = None
+        self._update_window_region()
+
+    def _watchdog_screen_size(self):
+        """屏幕尺寸/DPI 看门狗 + 窗口健康看门狗（每 1 秒）：应对全屏 UWP 应用（如
+        Windows「照片」）打开/关闭时 DWM 重置导致桌宠整体消失。
+
+        ① 屏幕尺寸变化：更新 self.screen_w/h、钳回越界宠物、重置 region 签名、重设 region；
+        ② 窗口健康：检测「是否被隐藏 / WS_EX_LAYERED 分层位是否丢失 / 颜色键透明是否失效」，
+           任一异常即调用 _refresh_window_style 强制恢复（否则桌宠凭空消失且无法自行恢复）。
         """
         try:
+            # ---- ① 屏幕尺寸变化 ----
             sw, sh = get_screen_size()
             if (sw, sh) != (self.screen_w, self.screen_h) and sw > 0 and sh > 0:
                 log.info(f"[mate_paw] 屏幕尺寸变化 {self.screen_w}x{self.screen_h} -> {sw}x{sh}，重定位宠物")
                 self.screen_w, self.screen_h = sw, sh
-                changed = False
                 for pet in self.pets:
                     pet.screen_w, pet.screen_h = sw, sh
-                    nx = min(max(pet.x, 0), max(0, sw - SPRITE_W))
-                    ny = min(max(pet.y, 0), max(0, sh - SPRITE_H))
-                    if nx != pet.x or ny != pet.y:
-                        pet.x, pet.y = nx, ny
-                        changed = True
-                # 强制下一次 _update_window_region 重建 region（否则 sig 未变会跳过）
+                    pet.x = min(max(pet.x, 0), max(0, sw - SPRITE_W))
+                    pet.y = min(max(pet.y, 0), max(0, sh - SPRITE_H))
+                # 尺寸变了，必定重设窗口几何 + region + 透明样式，一次性兜底
+                try:
+                    self.root.geometry(f'{sw}x{sh}+0+0')
+                except Exception:
+                    pass
                 self._region_sig = None
+                self._refresh_window_style()
+            else:
+                # ---- ② 窗口健康（尺寸未变时也持续巡检）----
+                # 仅以「窗口被隐藏」和「WS_EX_LAYERED 分层位丢失」作为触发条件：
+                # 这两者都会令桌宠整体不可见（即用户报告的"全部消失"）。颜色键失效等
+                # 边缘情形不在此自动触发，避免 GetLayeredWindowAttributes 在健康窗口上
+                # 偶发返回 None 引发每秒反复重设闪烁。
+                need_refresh = False
                 if self.hwnd:
+                    try:
+                        if not is_window_visible(self.hwnd):
+                            need_refresh = True
+                        ex = get_window_exstyle(self.hwnd)
+                        if not (ex & 0x00080000):  # WS_EX_LAYERED
+                            need_refresh = True
+                    except Exception:
+                        pass
+                if need_refresh:
+                    log.warning("[mate_paw] 检测到窗口透明/可见性丢失，正在恢复")
+                    self._refresh_window_style()
+                else:
+                    # 轻量保活：顶层状态随时恢复（幂等、无闪烁）
                     try:
                         self.root.attributes('-topmost', True)
                     except Exception:
                         pass
-                self._update_window_region()
         except Exception as e:
             log.debug(f"[mate_paw] screen watchdog error: {e}")
         finally:
-            # 每 2 秒轮询一次（轻量；失败也不影响主循环）
-            self.root.after(2000, self._watchdog_screen_size)
+            # 每 1 秒轮询一次（轻量；失败也不影响主循环）
+            self.root.after(1000, self._watchdog_screen_size)
 
     def _bind_canvas_events(self):
         """在 canvas 上绑定宠物拖动/释放/右键事件 —— 替代之前依赖鼠标钩子的方案。"""
