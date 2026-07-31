@@ -46,6 +46,23 @@ def test_window_health_helpers_no_crash():
     platform_win.show_window(12345)
 
 
+def test_foreground_process_name_no_crash():
+    # 真实环境下返回当前前台进程名（小写）；非 Windows 返回 ''
+    name = platform_win.get_foreground_process_name()
+    assert isinstance(name, str)
+    # 不应包含路径分隔符（已是 basename）
+    assert '/' not in name and '\\' not in name
+
+
+def test_screenshot_processes_includes_windows_tools():
+    # 验证 SCREENSHOT_PROCESSES 集合包含 Windows 自带截图工具
+    import desktop_pet as dp
+    assert 'screenclippinghost.exe' in dp.SCREENSHOT_PROCESSES
+    assert 'snippingtool.exe' in dp.SCREENSHOT_PROCESSES
+    # 集合内进程名应全小写（与 get_foreground_process_name 输出一致）
+    assert all(p == p.lower() for p in dp.SCREENSHOT_PROCESSES)
+
+
 def test_set_window_region_empty_uses_null_not_empty_region():
     """空 rects 必须移除 region（SetWindowRgn(hwnd, NULL)）而不是创建零尺寸 region。
 

@@ -37,6 +37,20 @@ if HAS_WIN32:
     user32.SetWindowRgn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
     user32.SetWindowRgn.restype = ctypes.c_int
 
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint)
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+    user32.GetWindowThreadProcessId.restype = ctypes.c_uint
+
     # 低级鼠标钩子相关常量
     WH_MOUSE_LL = 14
     WM_LBUTTONDOWN = 0x0201
@@ -205,6 +219,35 @@ if HAS_WIN32:
         except Exception:
             pass
 
+    def get_foreground_process_name():
+        """返回当前前台窗口所属进程的可执行文件名（小写，无路径）。
+
+        用于截屏感知：检测到截图工具（ScreenClippingHost / SnippingTool 等）在前台时，
+        暂停桌宠动画并抑制窗口恢复，避免桌宠在截图遮罩上"重新冒出并继续动作"。
+        失败返回 ''。
+        """
+        try:
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return ''
+            pid = ctypes.c_uint()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) 权限通常足够，无需管理员
+            h = kernel32.OpenProcess(0x1000, False, pid.value)
+            if not h:
+                return ''
+            try:
+                buf = ctypes.create_unicode_buffer(1024)
+                size = ctypes.c_uint(1024)
+                if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                    import os as _os
+                    return _os.path.basename(buf.value).lower()
+            finally:
+                kernel32.CloseHandle(h)
+        except Exception:
+            pass
+        return ''
+
 else:
     # -------- 非 Windows 平台：安全空实现，保证可 import / 可测试 --------
     WH_MOUSE_LL = 14
@@ -250,3 +293,6 @@ else:
 
     def show_window(hwnd):
         pass
+
+    def get_foreground_process_name():
+        return ''

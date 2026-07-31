@@ -38,6 +38,7 @@ from platform_win import (
     get_window_exstyle,
     get_layered_colorkey,
     show_window,
+    get_foreground_process_name,
     MSLLHOOKSTRUCT,
     WM_LBUTTONDOWN,
     WM_LBUTTONUP,
@@ -198,6 +199,26 @@ def setup_logging(level_name: str = "INFO") -> None:
 
 # 导入即应用一次配置（同时完成日志初始化），保证任何位置的 log 调用都有去处
 apply_config(CONFIG)
+
+
+# ============================================================
+# 截屏感知：检测到截图工具在前台时，暂停桌宠动画 + 抑制窗口恢复，
+# 避免桌宠在截图遮罩上"重新冒出并继续动作"（用户报告的问题）。
+# ============================================================
+# 触发暂停的截图工具进程名（小写，无路径）。Windows 自带 + 常见第三方。
+SCREENSHOT_PROCESSES = {
+    'screenclippinghost.exe',  # Win+Shift+S（Win10/11 截图草图）
+    'snippingtool.exe',        # Win11 截图工具
+    'snipsketch.exe',          # Win10 截图和草图
+    'screensketch.exe',        # 旧版 Screen Sketch
+    'snipaste.exe',            # Snipaste
+    'sharex.exe',              # ShareX
+    'greenshot.exe',           # Greenshot
+    'picpick.exe',             # PicPick
+    'fscapture.exe',           # FastStone Capture
+}
+# 前台进程检测间隔（帧）。UPDATE_MS≈33ms@30fps 时，5 帧≈0.16s，足够快且开销可忽略
+FG_CHECK_INTERVAL = 5
 
 
 def state_path():
@@ -1055,6 +1076,8 @@ class MatePawApp:
         self.hwnd = None  # 主窗口句柄，用于 SetWindowRgn
         self._region_sig = None  # 窗口可点区域签名缓存（未变则跳过 SetWindowRgn）
         self._health_tick = 0    # 窗口健康看门狗节拍计数
+        self._screenshot_active = False  # 截图工具在前台时置 True：冻结动画 + 抑制恢复
+        self._fg_check_counter = 0        # 前台进程检测帧计数（每 N 帧查一次）
         self.paused = False  # 全局暂停：宠物停止爬行但保持显示/呼吸
         self.state_path = state_path()  # 状态持久化文件路径
         # 鼠标钩子内用于跟踪是否吞掉右键事件（仅由钩子线程读写，避免竞态）
@@ -1215,11 +1238,14 @@ class MatePawApp:
                             need_refresh = True
                     except Exception:
                         pass
-                if need_refresh:
+                # 截屏期间（截图工具在前台）抑制强制恢复：截图遮罩会令窗口"看似"异常，
+                # 此时若 ShowWindow + 重设 -topmost 会让桌宠在遮罩上重新冒出（用户报告的问题）。
+                # 截屏结束后 _screenshot_active 复位，看门狗会正常恢复。
+                if need_refresh and not self._screenshot_active:
                     log.warning("[mate_paw] 检测到窗口透明/可见性丢失，正在恢复")
                     self._refresh_window_style()
-                else:
-                    # 轻量保活：顶层状态随时恢复（幂等、无闪烁）
+                elif not self._screenshot_active:
+                    # 轻量保活：顶层状态随时恢复（幂等、无闪烁）；截屏时跳过，避免冒出
                     try:
                         self.root.attributes('-topmost', True)
                     except Exception:
@@ -1496,6 +1522,23 @@ class MatePawApp:
                 self._save_state()
 
     def _animate(self):
+        # 截屏感知：每 N 帧查一次前台进程，若为截图工具则冻结桌宠。
+        # 解决两个问题：① 不再"继续动作"（冻结状态机/动画/位置）；
+        # ② 不再"重新冒出"（截图期间 _watchdog 会跳过 _refresh_window_style）。
+        self._fg_check_counter += 1
+        if self._fg_check_counter >= FG_CHECK_INTERVAL:
+            self._fg_check_counter = 0
+            try:
+                name = get_foreground_process_name()
+                self._screenshot_active = name in SCREENSHOT_PROCESSES
+            except Exception:
+                self._screenshot_active = False
+
+        if self._screenshot_active:
+            # 截屏中：冻结画面（不推进状态机/动画/位置），保证截图干净、桌宠不冒出
+            self.root.after(UPDATE_MS, self._animate)
+            return
+
         try:
             while not self.mouse_q.empty():
                 et, x, y = self.mouse_q.get_nowait()
