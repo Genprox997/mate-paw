@@ -1057,6 +1057,8 @@ class MatePaw:
         by = min(by, self.screen_h - self.bubble_h // 2 - 4)
         self.canvas.itemconfig(self.bubble_id, state='normal')
         self.canvas.coords(self.bubble_id, bx, by)
+        # 将气泡提到 canvas 最顶层，避免被其他宠物的身体遮挡
+        self.canvas.tag_raise(self.bubble_id)
 
 
 
